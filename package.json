@@ -1,0 +1,10 @@
+{
+  "name": "tile-layer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Tile layout math engine: where to snap the chalk lines and which tile to set first.",
+  "scripts": {
+    "test": "node layout.test.js"
+  }
+}

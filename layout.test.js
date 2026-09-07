@@ -1,0 +1,441 @@
+// layout.test.js — run with `node layout.test.js` (or `npm test`).
+//
+// Every case prints a row in a table at the end: what went in, what came
+// out, and whether the assertions held. Read the table, not just the count.
+
+import assert from 'node:assert/strict';
+import {
+  computeLayout, centerAxis, roundSixteenth, formatInches, formatFeetInches, lShape,
+} from './layout.js';
+
+const rows = [];
+let failures = 0;
+
+function test(name, input, fn) {
+  const row = { name, input, result: '', status: 'pass' };
+  try {
+    row.result = fn() || '';
+  } catch (e) {
+    failures += 1;
+    row.status = 'FAIL';
+    row.result = (e && e.message) || String(e);
+    console.error(`\nFAIL ${name}\n${e.stack || e}`);
+  }
+  rows.push(row);
+}
+
+const closeTo = (a, b, tol, msg) => assert.ok(Math.abs(a - b) <= tol, `${msg || ''} expected ${b} +/- ${tol}, got ${a}`);
+const inches = (m) => (m ? m.displayInches : '-');
+const wallVals = (layout, wall) => layout.cutsByWall[wall].values.map(v => v.rounded);
+
+/**
+ * The invariant every case must satisfy: on each axis the two walls the grid
+ * was centred between report the same set of cut widths.
+ */
+function assertOppositeWallsEqual(result) {
+  for (const key of ['parallel', 'perpendicular']) {
+    const layout = result.orientations[key];
+    if (!layout.axes) continue; // diagonal and herringbone have no straight wall cuts
+    for (const axis of ['x', 'y']) {
+      const [a, b] = layout.axes[axis].centeredBetween;
+      assert.deepEqual(wallVals(layout, a), wallVals(layout, b),
+        `${key}: cuts on ${a} ${JSON.stringify(wallVals(layout, a))} differ from ${b} ${JSON.stringify(wallVals(layout, b))}`);
+    }
+  }
+}
+
+/** After a half-module shift, C must sit in [M/2, M). */
+function assertShiftInvariant(axis) {
+  if (axis.shift.fraction === 0.5) {
+    assert.ok(axis.C >= axis.M / 2 - 1e-9 && axis.C < axis.M, `shifted C=${axis.C} not in [${axis.M / 2}, ${axis.M})`);
+  }
+}
+
+function summary(result) {
+  const L = result.layout;
+  const cuts = Object.entries(L.cutsByWall)
+    .filter(([, v]) => v.values.length)
+    .map(([w, v]) => `${w} ${v.values.map(x => x.displayInches).join('/')}`)
+    .join(', ');
+  const start = L.start.from.map(f => `${f.display} from ${f.wall}`).join(', ');
+  return `${result.recommended}; start ${start}; full ${L.counts.full}, cut ${L.counts.cut}; `
+    + `cuts: ${cuts || 'none by wall'}; smallest ${inches(L.smallestCut)}; waste ${L.waste.allowancePct}%`
+    + (L.warnings.length ? `; ${L.warnings.length} warning(s)` : '');
+}
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
+
+test('display rounds to 1/16"', '5.15, 126.53, 11.97, 0.03', () => {
+  assert.equal(formatInches(5.15), '5 1/8"');
+  assert.equal(formatFeetInches(126.53), `10' 6 1/2"`);
+  assert.equal(formatInches(11.97), '12"');
+  assert.equal(formatInches(0.03), '0"');
+  assert.equal(formatInches(5.1875), '5 3/16"');
+  assert.equal(formatFeetInches(11.9999), `1' 0"`);
+  assert.equal(roundSixteenth(5.15625), 5.1875);
+  return '5 1/8", 10\' 6 1/2", 12", 0"';
+});
+
+// ---------------------------------------------------------------------------
+// Per-axis algorithm
+// ---------------------------------------------------------------------------
+
+test('axis: room divides evenly by the module, no shift', '121.25" span, 12" tile, 1/8" joint', () => {
+  const a = centerAxis(121.25, 12, 0.125);
+  assert.equal(a.n, 10);
+  closeTo(a.R, 0, 1e-9);
+  assert.equal(a.shifted, false);
+  assert.equal(a.exact, true);
+  assert.equal(a.cutPiece, 0);
+  return `n=${a.n}, R=${a.R}, exact fit, no cut, ${formatInches(a.wallGap)} gap at each wall`;
+});
+
+test('axis: 1" sliver forces the half-module shift', '111.125" span, 12" tile, 1/8" joint', () => {
+  const a = centerAxis(111.125, 12, 0.125);
+  closeTo(a.R, 2, 1e-9, 'R');
+  assert.equal(a.shifted, true);
+  assert.equal(a.n, 8);
+  assert.ok(a.C >= a.M / 2 && a.C < a.M, `C=${a.C} not in [M/2, M)`);
+  closeTo(a.C, 1 + 12.125 / 2, 1e-9, 'C');
+  return `C was 1", shifted to ${formatInches(a.C)} (M/2=${formatInches(a.M / 2)}), n 9 -> 8, wall piece ${formatInches(a.cutPiece)}`;
+});
+
+test('axis: cut exactly at the threshold does not shift', '117.125" span, 12" tile, 1/8" joint (C=4=tile/3)', () => {
+  const a = centerAxis(117.125, 12, 0.125);
+  closeTo(a.C, 4, 1e-9);
+  assert.equal(a.shifted, false);
+  return `C=${formatInches(a.C)} = threshold ${a.threshold}, no shift`;
+});
+
+test('axis: span narrower than one module is a single piece', '8" span, 12" tile', () => {
+  const a = centerAxis(8, 12, 0.125);
+  assert.equal(a.n, 0);
+  assert.equal(a.singlePiece, true);
+  assert.equal(a.cutPiece, 8);
+  return 'one 8" piece wall to wall';
+});
+
+test('axis: threshold never exceeds half the tile (mosaic)', '50.5" span, 3" tile, 1/8" joint', () => {
+  const a = centerAxis(50.5, 3, 0.125);
+  assert.equal(a.shifted, true);
+  assert.equal(a.threshold, 1.5);
+  assert.ok(a.cutPiece <= 3 + 1e-9, `piece ${a.cutPiece} bigger than the tile`);
+  return `threshold ${a.threshold}", piece ${formatInches(a.cutPiece)}`;
+});
+
+// ---------------------------------------------------------------------------
+// Whole layouts
+// ---------------------------------------------------------------------------
+
+test('reference gazebo: 120x144, 12x24, 3/16 joint', '120" x 144" room, 12x24 tile, 3/16" joint, stack, focal north, 8 per box', () => {
+  const r = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 24, rectified: true }, grout: 3 / 16, pattern: 'stack', focalWall: 'north', tilesPerBox: 8 });
+  assertOppositeWallsEqual(r);
+  const L = r.orientations.parallel;
+  assert.equal(L.axes.x.shifted, false, 'x shifted');
+  assert.equal(L.axes.y.shifted, false, 'y shifted');
+  closeTo(L.axes.y.C, 11.53, 0.02, 'C along the 144" axis');
+  closeTo(L.axes.x.C, 5.16, 0.02, 'C along the 120" axis');
+  assert.equal(L.axes.x.n, 9);
+  assert.equal(L.axes.y.n, 5);
+  // physical pieces are C less half a joint
+  closeTo(wallVals(L, 'north')[0], roundSixteenth(11.53 - 3 / 32), 1 / 16);
+  closeTo(wallVals(L, 'west')[0], roundSixteenth(5.16 - 3 / 32), 1 / 16);
+  assert.equal(L.counts.full, 45);
+  assert.equal(L.counts.cut, 32);
+  assert.equal(L.counts.corner, 4);
+  assert.equal(L.warnings.length, 0, JSON.stringify(L.warnings));
+  assert.equal(r.recommended, 'parallel');
+  assert.ok(r.orientations.perpendicular.counts.full > 0);
+  assert.equal(L.purchase.boxes, 9);
+  assert.equal(L.waste.allowancePct, 10);
+  closeTo(L.area.fieldSqFt, 120, 1e-9);
+  assert.equal(L.lines[0].from, 'north');
+  closeTo(L.lines[0].inches, L.axes.y.C + 3 / 32, 1e-9, 'line A is the near edge of the first full course');
+  closeTo(L.start.from[1].inches, L.axes.x.C + 3 / 32, 1e-9, 'start tile from the west wall');
+  return summary(r) + `; C=${L.axes.y.C.toFixed(2)} (144 axis), ${L.axes.x.C.toFixed(2)} (120 axis); boxes ${L.purchase.boxes}`;
+});
+
+test('room that divides evenly: no shift, no cuts, movement-joint warning', '121.25" x 97" room, 12x12 tile, 1/8" joint', () => {
+  const r = computeLayout({ room: { width: 121.25, height: 97 }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'stack' });
+  assertOppositeWallsEqual(r);
+  const L = r.layout;
+  assert.equal(L.axes.x.shifted, false);
+  assert.equal(L.axes.y.shifted, false);
+  assert.equal(L.axes.x.exact, true);
+  assert.equal(L.counts.full, 80);
+  assert.equal(L.counts.cut, 0);
+  assert.ok(L.warnings.some(w => /movement joint/.test(w)), 'expected the movement joint warning');
+  assert.ok(L.lines[0].inches >= 2, 'chalk line moved one course in');
+  return summary(r);
+});
+
+test('1" sliver room: shift lands C in [M/2, M)', '111.125" x 100" room, 12x12 tile, 1/8" joint', () => {
+  const r = computeLayout({ room: { width: 111.125, height: 100 }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'stack' });
+  assertOppositeWallsEqual(r);
+  const L = r.layout;
+  assert.equal(L.axes.x.shifted, true);
+  assertShiftInvariant(L.axes.x);
+  assertShiftInvariant(L.axes.y);
+  assert.equal(L.axes.x.n, 8);
+  assert.equal(wallVals(L, 'west').length, 1);
+  closeTo(wallVals(L, 'west')[0], 7, 1e-9, 'west piece');
+  assert.ok(L.smallestCut.inches >= 2, 'no sliver survives');
+  assert.ok(!L.warnings.some(w => /Slivers/.test(w)));
+  return summary(r) + `; x: C ${L.axes.x.C} in [${L.axes.x.M / 2}, ${L.axes.x.M})`;
+});
+
+test('room narrower than two tiles', '20" x 30" room, 12x12 tile, 1/8" joint', () => {
+  const r = computeLayout({ room: { width: 20, height: 30 }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'stack' });
+  assertOppositeWallsEqual(r);
+  const L = r.layout;
+  assert.equal(L.axes.x.n, 0);
+  assert.equal(L.axes.x.shifted, true, 'one tile plus two slivers becomes two real pieces');
+  assertShiftInvariant(L.axes.x);
+  assert.equal(L.counts.full, 0);
+  closeTo(wallVals(L, 'west')[0], 9.9375, 1e-9);
+  assert.ok(L.smallestCut.inches >= 2);
+  assert.ok(/no full tile/i.test(L.start.description));
+  return summary(r);
+});
+
+test('room narrower than one tile: single piece', '8" x 40" room, 12x12 tile', () => {
+  const r = computeLayout({ room: { width: 8, height: 40 }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'stack' });
+  assertOppositeWallsEqual(r);
+  const L = r.layout;
+  assert.equal(L.axes.x.singlePiece, true);
+  assert.equal(L.counts.full, 0);
+  assert.equal(wallVals(L, 'west')[0], 8);
+  assert.equal(wallVals(L, 'east')[0], 8);
+  assert.ok(L.lines.every(l => l.inches >= 0), 'no negative chalk line');
+  return summary(r);
+});
+
+test('L-shape whose legs want different origins', '144" x 120" L, 53" x 54.5" notch NE, 12x12 tile, 1/8" joint', () => {
+  // Centred on the full width, the inner east wall would get a 3/4" sliver
+  // and the inner north wall a 1/2" sliver. Centred on the narrow leg, the
+  // east wall would get 1 3/8". The engine has to find the grid that clears
+  // every wall.
+  const r = computeLayout({ room: { width: 144, height: 120, notch: { width: 53, height: 54.5, corner: 'northeast' } }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'stack' });
+  assertOppositeWallsEqual(r);
+  const L = r.layout;
+  assert.equal(r.room.corners, 6);
+  assert.equal(L.waste.allowancePct, 15, '10% + 5% for more than four corners');
+  assert.ok(L.smallestCut.inches >= L.axes.x.threshold - 1e-9, `smallest cut ${L.smallestCut.inches} under threshold`);
+  for (const w of ['west', 'east', 'inner east', 'north', 'south', 'inner north']) {
+    assert.ok(L.cutsByWall[w].values.length > 0, `${w} has cuts`);
+    assert.ok(L.cutsByWall[w].min.inches >= 2, `${w} has a sliver: ${L.cutsByWall[w].min.inches}`);
+  }
+  assert.equal(L.axes.x.shifted, true, 'x axis shifted to clear the inner wall');
+  assertShiftInvariant(L.axes.x);
+  assert.ok(!L.warnings.some(w => /Slivers/.test(w)));
+  closeTo(L.area.fieldSqFt, (144 * 120 - 53 * 54.5) / 144, 1e-9);
+  assert.equal(L.counts.corner, 6, 'four outside corners plus the notch corner tile');
+  return summary(r);
+});
+
+test('L-shape via explicit polygon matches the shorthand', 'same L as a point list', () => {
+  const a = computeLayout({ room: lShape(144, 120, 53, 54.5), tile: { width: 12, height: 12 }, grout: 0.125 });
+  const b = computeLayout({ room: [[0, 0], [91, 0], [91, 54.5], [144, 54.5], [144, 120], [0, 120]], tile: { width: 12, height: 12 }, grout: 0.125 });
+  assert.deepEqual(a.layout.counts, b.layout.counts);
+  assert.deepEqual(a.layout.cutsByWall, b.layout.cutsByWall);
+  return `${a.layout.counts.full} full, ${a.layout.counts.cut} cut both ways`;
+});
+
+test('running bond 50%: side walls take two values, lippage warning on 24" tile', '120" x 144" room, 12x24 tile, 3/16" joint, running 50%', () => {
+  const r = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 24 }, grout: 3 / 16, pattern: 'running', offset: 0.5, focalWall: 'north' });
+  assertOppositeWallsEqual(r);
+  const L = r.layout;
+  assert.equal(L.rows.axis, 'x');
+  assert.equal(wallVals(L, 'west').length, 2, 'two cut widths on the west wall');
+  assert.equal(wallVals(L, 'east').length, 2);
+  assert.equal(wallVals(L, 'north').length, 1, 'walls parallel to the courses see one width');
+  const [a, b] = wallVals(L, 'west');
+  closeTo(b - a, L.axes.x.M / 2, 1 / 16, 'the two widths differ by half a module');
+  assert.ok(L.warnings.some(w => /lippage/.test(w)), 'lippage warning');
+  closeTo(L.rows.shiftPerCourse.inches, L.axes.x.M / 2, 1e-9);
+  return summary(r);
+});
+
+test('running bond 50% avoids a sliver with a quarter-module shift', '110" x 100" room, 12x12 tile, 1/8" joint, running 50%', () => {
+  // C = 7/16" here. A half-module shift only swaps which course gets the
+  // sliver, so the engine must shift a quarter module instead.
+  const r = computeLayout({ room: { width: 110, height: 100 }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'running', offset: 0.5 });
+  assertOppositeWallsEqual(r);
+  const L = r.layout;
+  assert.equal(L.axes.x.shift.fraction, 0.25, 'quarter shift');
+  assert.ok(L.smallestCut.inches >= 2, `sliver survived: ${L.smallestCut.inches}`);
+  assert.equal(wallVals(L, 'west').length, 2);
+  return summary(r) + `; shift ${L.axes.x.shift.fraction} M`;
+});
+
+test('running bond 33%: no lippage warning, three widths per side wall', '110" x 97" room, 12x24 tile, 1/8" joint, running 1/3, focal east', () => {
+  const r = computeLayout({ room: { width: 110, height: 97 }, tile: { width: 12, height: 24 }, grout: 0.125, pattern: 'running', offset: 1 / 3, focalWall: 'east' });
+  assertOppositeWallsEqual(r);
+  const L = r.layout;
+  assert.equal(L.rows.axis, 'y', 'courses run north-south along the east focal wall');
+  assert.ok(!L.warnings.some(w => /lippage/.test(w)), 'a third offset is allowed on large format');
+  assert.equal(L.lines[0].from, 'east');
+  assert.equal(L.lines[1].from, 'north');
+  assert.ok(wallVals(L, 'north').length >= 2);
+  return summary(r);
+});
+
+test('focal wall south: lines measured from south and east', '120" x 144" room, 12x24, stack, focal south', () => {
+  const r = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 24 }, grout: 3 / 16, pattern: 'stack', focalWall: 'south' });
+  assertOppositeWallsEqual(r);
+  const L = r.layout;
+  assert.equal(L.lines[0].from, 'south');
+  assert.equal(L.lines[1].from, 'east');
+  closeTo(L.lines[0].inches, 11.625, 1e-9);
+  closeTo(L.lines[1].inches, 5.25, 1e-9);
+  assert.equal(L.start.from[0].wall, 'south');
+  return summary(r);
+});
+
+test('diagonal: every perimeter tile is a cut, coverage is sound', '120" x 144" room, 12x12 tile, 1/8" joint, diagonal', () => {
+  const r = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'diagonal' });
+  const L = r.layout;
+  assert.equal(L.waste.allowancePct, 15);
+  for (const c of L.tiles) {
+    const touches = c.points.some(p => p.x < 1e-6 || p.y < 1e-6 || p.x > 120 - 1e-6 || p.y > 144 - 1e-6);
+    if (touches) assert.equal(c.full, false, 'a tile reaching a wall must be a cut');
+  }
+  const expected = (12 * 12) / (12.125 * 12.125);
+  closeTo(L.area.tileSqFtLaid / L.area.fieldSqFt, expected, 0.02, 'tile face fraction of the floor');
+  assert.equal(L.lines[0].angle, 45);
+  assert.equal(L.lines.length, 2);
+  assert.ok(L.counts.full > 0 && L.counts.cut > 0);
+  return summary(r) + `; ${L.lines[0].description}`;
+});
+
+test('herringbone: no gaps, no overlaps, coverage is sound', '60" x 50" room, 6x12 tile, 1/8" joint, herringbone', () => {
+  const r = computeLayout({ room: { width: 60, height: 50 }, tile: { width: 6, height: 12 }, grout: 0.125, pattern: 'herringbone' });
+  const L = r.layout;
+  assert.equal(L.waste.allowancePct, 15);
+  const cells = L.tiles;
+  for (let i = 0; i < cells.length; i++) {
+    for (let j = i + 1; j < cells.length; j++) {
+      const a = cells[i], b = cells[j];
+      const ox = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0), oy = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+      assert.ok(ox <= 1e-6 || oy <= 1e-6, `tiles ${i} and ${j} overlap`);
+    }
+  }
+  const expected = (6 * 12) / (6.125 * 12.125);
+  closeTo(L.area.tileSqFtLaid / L.area.fieldSqFt, expected, 0.02, 'tile face fraction of the floor');
+  assert.ok(L.counts.full > 0 && L.counts.cut > 0);
+  return summary(r);
+});
+
+test('orientation: both computed, better one flagged', '96" x 140" room, 6x24 plank, 1/8" joint, stack', () => {
+  const r = computeLayout({ room: { width: 96, height: 140 }, tile: { width: 6, height: 24 }, grout: 0.125, pattern: 'stack' });
+  assertOppositeWallsEqual(r);
+  const p = r.orientations.parallel, q = r.orientations.perpendicular;
+  assert.equal(p.longAxisAlong, 'y', 'parallel: 24" side runs with the 140" wall');
+  assert.equal(q.longAxisAlong, 'x');
+  assert.equal(p.better !== q.better, true, 'exactly one flagged');
+  assert.equal(r.orientations[r.recommended].better, true);
+  assert.ok(typeof p.waste.actualPct === 'number' && typeof q.waste.actualPct === 'number');
+  assert.ok(p.smallestCut && q.smallestCut);
+  return `${r.recommended}: ${r.orientationNote} parallel waste ${p.waste.actualPct.toFixed(1)}%/smallest ${inches(p.smallestCut)}, perpendicular ${q.waste.actualPct.toFixed(1)}%/${inches(q.smallestCut)}`;
+});
+
+test('warnings: tight joint on non-rectified tile', '120" x 144", 12x12 non-rectified, 1/16" joint', () => {
+  const r = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 12, rectified: false }, grout: 1 / 16, pattern: 'stack' });
+  assert.ok(r.warnings.some(w => /non-rectified/.test(w)));
+  const ok = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 12, rectified: true }, grout: 1 / 16, pattern: 'stack' });
+  assert.ok(!ok.warnings.some(w => /non-rectified/.test(w)));
+  return r.warnings.find(w => /non-rectified/.test(w));
+});
+
+test('warnings: obstacle sliver and obstacle cut count', '120" x 144", 12x12, 1/8" joint, 12" column 1" off a joint', () => {
+  const r = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'stack', obstacles: [{ x: 42.875, y: 40, width: 12, height: 12, label: 'column' }] });
+  assertOppositeWallsEqual(r);
+  const L = r.layout;
+  assert.equal(L.counts.obstacle, 4);
+  assert.ok(L.warnings.some(w => /against the column/.test(w)), JSON.stringify(L.warnings));
+  closeTo(L.area.fieldSqFt, 119, 1e-9, 'obstacle area comes off the field');
+  return summary(r);
+});
+
+test('warnings: waste above 20 percent', '20" x 30" room, 12x12 tile', () => {
+  const r = computeLayout({ room: { width: 20, height: 30 }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'stack' });
+  assert.ok(r.warnings.some(w => /Waste runs to/.test(w)));
+  return `${r.layout.waste.actualPct.toFixed(0)}% actual`;
+});
+
+test('boxes round up', '120" x 144", 12x24, 3/16", 8 tiles per box', () => {
+  const r = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 24 }, grout: 3 / 16, pattern: 'stack', tilesPerBox: 8 });
+  const P = r.layout.purchase;
+  assert.equal(P.tilesToBuy, 66, '120 sq ft + 10% = 132 sq ft = 66 tiles');
+  assert.equal(P.boxes, 9);
+  const none = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 24 }, grout: 3 / 16, pattern: 'stack' });
+  assert.equal(none.layout.purchase.boxes, null);
+  return `${P.sqFtToBuy} sq ft, ${P.tilesToBuy} tiles, ${P.boxes} boxes`;
+});
+
+test('opposite walls equal across a sweep of rooms and patterns', '18 rooms x stack, running 50%, running 33% x 2 tiles x 2 focal walls', () => {
+  let n = 0;
+  for (const w of [37, 60, 96.5, 110, 121.25, 144]) {
+    for (const h of [41, 72.25, 97]) {
+      for (const pattern of ['stack', 'running']) {
+        for (const tile of [{ width: 12, height: 12 }, { width: 12, height: 24 }]) {
+          for (const offset of pattern === 'running' ? [0.5, 1 / 3] : [0]) {
+            for (const focalWall of ['north', 'east']) {
+              const r = computeLayout({ room: { width: w, height: h }, tile, grout: 0.125, pattern, offset, focalWall });
+              assertOppositeWallsEqual(r);
+              for (const key of ['parallel', 'perpendicular']) {
+                assertShiftInvariant(r.orientations[key].axes.x);
+                assertShiftInvariant(r.orientations[key].axes.y);
+              }
+              n++;
+            }
+          }
+        }
+      }
+    }
+  }
+  return `${n} layouts, opposite walls equal in every one, C in [M/2, M) after every half shift`;
+});
+
+// ---------------------------------------------------------------------------
+// Table
+// ---------------------------------------------------------------------------
+
+function wrap(text, width) {
+  const words = String(text).split(/\s+/);
+  const lines = [];
+  let cur = '';
+  for (const word of words) {
+    if (cur && (cur + ' ' + word).length > width) { lines.push(cur); cur = word; }
+    else cur = cur ? cur + ' ' + word : word;
+  }
+  if (cur) lines.push(cur);
+  return lines.length ? lines : [''];
+}
+
+function printTable() {
+  const cols = [
+    { key: 'idx', title: '#', width: 3 },
+    { key: 'name', title: 'case', width: 34 },
+    { key: 'input', title: 'input', width: 34 },
+    { key: 'result', title: 'result', width: 78 },
+    { key: 'status', title: 'status', width: 6 },
+  ];
+  const line = cols.map(c => '-'.repeat(c.width)).join('-+-');
+  console.log('\n' + cols.map(c => c.title.padEnd(c.width)).join(' | '));
+  console.log(line);
+  rows.forEach((row, i) => {
+    const cellLines = cols.map(c => wrap(c.key === 'idx' ? i + 1 : row[c.key], c.width));
+    const height = Math.max(...cellLines.map(l => l.length));
+    for (let k = 0; k < height; k++) {
+      console.log(cols.map((c, j) => (cellLines[j][k] || '').padEnd(c.width)).join(' | '));
+    }
+    console.log(line);
+  });
+  console.log(`\n${rows.length - failures} passed, ${failures} failed`);
+}
+
+printTable();
+process.exit(failures ? 1 : 0);
