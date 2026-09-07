@@ -366,6 +366,40 @@ export function centerAxis(roomDim, tileDim, grout) {
   return { M, n, R, C, threshold, shifted, exact, singlePiece, origin, cutPiece, wallGap, roomDim, tileDim, grout };
 }
 
+/**
+ * The course-to-course shift sequence for running bond, as a function of
+ * row index r. `offsetFrac` is the resolved {p, q, value} fraction of a
+ * module. Three shapes:
+ *
+ *   drift     (default) — shift accumulates by offset every row, mod M:
+ *             r*offset*M mod M. At offset = 1/q this repeats every q rows,
+ *             climbing the same direction each time ("staircase").
+ *   alternate — plain two-row bond regardless of q: row parity alone
+ *               decides unshifted vs shifted by offset. This is the
+ *               ordinary meaning of "running bond at X% offset" for any X.
+ *   zigzag    — steps out by Mr/q each row up to q-1 steps, then back down
+ *               to 0, a triangle wave of period 2(q-1). At q = 3 (1/3
+ *               offset) this is the 0, 1, 2, 1 course-shift bounce.
+ */
+export function rowShiftFn(offsetFrac, Mr, pattern = 'drift') {
+  const q = offsetFrac.q;
+  if (pattern === 'alternate') {
+    return (r) => mod(r, 2) * offsetFrac.value * Mr;
+  }
+  if (pattern === 'zigzag') {
+    const amplitude = q - 1;
+    if (amplitude <= 0) return () => 0;
+    const period = 2 * amplitude;
+    const step = Mr / q;
+    return (r) => {
+      const cyc = mod(r, period);
+      const triangle = cyc <= amplitude ? cyc : period - cyc;
+      return triangle * step;
+    };
+  }
+  return (r) => mod(r * offsetFrac.value * Mr, Mr);
+}
+
 /** Snap an offset like 0.33 to 1/3 so the row cycle is exact. */
 function offsetFraction(offset) {
   for (let q = 1; q <= 6; q++) {
@@ -669,7 +703,7 @@ function layoutGrid(ctx, tx, ty, orientation) {
   const lFocal = focalAtStart ? lFirst : lLast;
   const rowIndex = (l) => (focalAtStart ? l - lFocal : lFocal - l);
   const Mr = tileRow + grout;
-  const rowShift = (r) => mod(r * offsetFrac.value * Mr, Mr);
+  const rowShift = rowShiftFn(offsetFrac, Mr, ctx.offsetPattern);
   const rowsTouching = (w) => {
     const rows = [];
     const lo = Math.floor((w.from - across.origin) / Ma) - 1;
@@ -763,7 +797,7 @@ function layoutGrid(ctx, tx, ty, orientation) {
   axes[acrossAxis] = axisReport(across, acrossAxis, room, tileAcross, grout, null);
   return finishLayout(ctx, cells, tx, ty, orientation, {
     axes, lines: [lineA, lineB], start: startHere,
-    rows: { axis: rowAxis, parallelTo: focalWall, shiftPerCourse: measurement(offsetFrac.value * Mr), offset: offsetFrac.value },
+    rows: { axis: rowAxis, parallelTo: focalWall, shiftPerCourse: measurement(offsetFrac.value * Mr), offset: offsetFrac.value, pattern: pattern === 'running' ? (ctx.offsetPattern || 'drift') : null },
   });
 }
 
@@ -1117,7 +1151,7 @@ const PATTERNS = ['stack', 'running', 'diagonal', 'herringbone'];
 const WALLS = ['north', 'south', 'east', 'west'];
 
 /**
- * computeLayout({ room, tile, grout, pattern, offset, focalWall, obstacles, tilesPerBox })
+ * computeLayout({ room, tile, grout, pattern, offset, offsetPattern, focalWall, obstacles, tilesPerBox })
  *
  *   room       polygon in inches (array of {x,y} or [x,y]), or {width,height}
  *              or {width,height,notch:{width,height,corner}}
@@ -1125,6 +1159,15 @@ const WALLS = ['north', 'south', 'east', 'west'];
  *   grout      joint width in inches
  *   pattern    'stack' | 'running' | 'diagonal' | 'herringbone'
  *   offset     0..0.5, running bond only
+ *   offsetPattern  running bond only, default 'drift':
+ *     drift     — shift accumulates every row, mod a module (r*offset*M mod M).
+ *                 At offset = 1/q this climbs the same direction for q rows,
+ *                 then repeats ("staircase").
+ *     alternate — plain two-row bond regardless of offset: odd rows shift,
+ *                 even rows don't. The ordinary meaning of "X% offset".
+ *     zigzag    — steps out by M/q each row up to q-1 steps, then back down
+ *                 to 0 (a triangle wave). At offset = 1/3 this is the
+ *                 0, 1, 2, 1 course-shift bounce.
  *   focalWall  'north' | 'south' | 'east' | 'west'
  *   obstacles  [{ x, y, width, height, label }] in room inches (optional)
  *   tilesPerBox  number (optional) — enables the box count
@@ -1144,8 +1187,12 @@ export function computeLayout(input) {
   let offset = input.offset == null ? 0.5 : +input.offset;
   if (pattern !== 'running') offset = 0;
   if (offset < 0 || offset > 0.5) throw new Error('offset must be between 0 and 0.5');
+  const offsetPattern = input.offsetPattern || 'drift';
+  if (!['drift', 'alternate', 'zigzag'].includes(offsetPattern)) {
+    throw new Error("offsetPattern must be 'drift', 'alternate', or 'zigzag'");
+  }
   const room = analyzeRoom(input.room, input.obstacles);
-  const ctx = { room, tile, grout, pattern, offset, focalWall, tilesPerBox: input.tilesPerBox || null };
+  const ctx = { room, tile, grout, pattern, offset, offsetPattern, focalWall, tilesPerBox: input.tilesPerBox || null };
 
   const long = Math.max(tile.width, tile.height), short = Math.min(tile.width, tile.height);
   const square = near(long, short);

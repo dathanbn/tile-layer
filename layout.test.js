@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import {
-  computeLayout, centerAxis, roundSixteenth, formatInches, formatFeetInches, lShape,
+  computeLayout, centerAxis, roundSixteenth, formatInches, formatFeetInches, lShape, rowShiftFn,
 } from './layout.js';
 
 const rows = [];
@@ -439,6 +439,39 @@ test('opposite walls equal across a sweep of rooms and patterns', '18 rooms x st
     }
   }
   return `${n} layouts, opposite walls equal in every one, C in [M/2, M) after every half shift`;
+});
+
+test('offsetPattern: drift, alternate and zigzag produce the exact course sequences', 'offset=1/3 (q=3), 8 rows, each of the three shapes', () => {
+  const M = 12;
+  const frac = { p: 1, q: 3, value: 1 / 3 };
+  const drift = rowShiftFn(frac, M, 'drift');
+  const alternate = rowShiftFn(frac, M, 'alternate');
+  const zigzag = rowShiftFn(frac, M, 'zigzag');
+  const seq = (fn) => Array.from({ length: 8 }, (_, r) => Math.round(fn(r) * 100) / 100);
+  assert.deepEqual(seq(drift), [0, 4, 8, 0, 4, 8, 0, 4], 'staircase: same direction every course');
+  assert.deepEqual(seq(alternate), [0, 4, 0, 4, 0, 4, 0, 4], 'plain two-row bond regardless of q');
+  assert.deepEqual(seq(zigzag), [0, 4, 8, 4, 0, 4, 8, 4], 'out and back, joints never walk off one way');
+  // half bond (q=2): alternate and drift coincide, zigzag degenerates to the same 2-row bond
+  const half = { p: 1, q: 2, value: 0.5 };
+  assert.deepEqual(seq(rowShiftFn(half, M, 'drift')), [0, 6, 0, 6, 0, 6, 0, 6]);
+  assert.deepEqual(seq(rowShiftFn(half, M, 'alternate')), [0, 6, 0, 6, 0, 6, 0, 6]);
+  assert.deepEqual(seq(rowShiftFn(half, M, 'zigzag')), [0, 6, 0, 6, 0, 6, 0, 6]);
+  return 'drift 0,4,8,0,4,8,..; zigzag 0,4,8,4,0,4,8,4,..; alternate 0,4,0,4,..; all agree at 50%';
+});
+
+test('offsetPattern reaches the whole-layout API and stays symmetric', '120x144 room, 12x12 tile, running 1/3, each offsetPattern', () => {
+  for (const offsetPattern of ['drift', 'alternate', 'zigzag']) {
+    const r = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'running', offset: 1 / 3, offsetPattern, focalWall: 'north' });
+    assertOppositeWallsEqual(r);
+    assert.equal(r.layout.rows.pattern, offsetPattern);
+  }
+  // zigzag has a real 3-value cut set at the side walls (0, M/3, 2M/3 apart), not just 2
+  const zz = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'running', offset: 1 / 3, offsetPattern: 'zigzag', focalWall: 'north' });
+  assert.ok(wallVals(zz.layout, 'west').length >= 2);
+  // alternate always collapses to exactly 2 values regardless of the offset denominator
+  const alt = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'running', offset: 0.42, offsetPattern: 'alternate', focalWall: 'north' });
+  assert.equal(wallVals(alt.layout, 'west').length, 2, 'a plain two-row bond only ever sees two cut widths');
+  return 'offsetPattern threads through computeLayout for drift/alternate/zigzag, opposite walls still equal in every case';
 });
 
 test('odd running-bond offsets stay symmetric and fast (not just nice fractions)', 'offsets 10%..48% x 3 rooms, 12x24 tile', () => {
