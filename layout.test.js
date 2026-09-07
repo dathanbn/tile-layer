@@ -375,6 +375,48 @@ test('boxes round up', '120" x 144", 12x24, 3/16", 8 tiles per box', () => {
   return `${P.sqFtToBuy} sq ft, ${P.tilesToBuy} tiles, ${P.boxes} boxes`;
 });
 
+test('purchase never recommends fewer tiles than the layout consumes', '100" x 130" room, 12x24 tile, 1/8" joint, stack', () => {
+  // The flat 10% allowance undercounts this room: reused-offcut accounting
+  // shows 54 tiles actually go into the floor (28 full + 26 for the cuts),
+  // while 100 sq ft field * 1.10 only buys 50. The purchase figure must be
+  // floored at the engine's own consumption count, not just the flat rule.
+  const r = computeLayout({ room: { width: 100, height: 130 }, tile: { width: 12, height: 24 }, grout: 0.125, pattern: 'stack', focalWall: 'north' });
+  const L = r.layout;
+  const consumed = L.counts.full + L.purchase.tilesForCuts;
+  assert.equal(consumed, 54);
+  assert.ok(L.purchase.tilesToBuy >= consumed, `tilesToBuy ${L.purchase.tilesToBuy} is short of the ${consumed} tiles the layout actually uses`);
+  closeTo(L.purchase.sqFtToBuy, L.purchase.tilesToBuy * 2, 1e-9, 'sqFtToBuy must agree with tilesToBuy');
+  return `flat allowance alone would buy ${Math.ceil(L.area.fieldSqFt * 1.10 * 144 / 288)} tiles, layout consumes ${consumed}, recommendation is ${L.purchase.tilesToBuy}`;
+});
+
+test('lippage warning boundary: exactly 15" and exactly 33% do not warn', '24" tile at 50%, 15" tile at 50%, 24" tile at 1/3', () => {
+  const at15 = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 15 }, grout: 0.125, pattern: 'running', offset: 0.5 });
+  assert.ok(!at15.warnings.some(w => /lippage/.test(w)), '15" exactly is not "over 15 inches"');
+  const over15 = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 15.5 }, grout: 0.125, pattern: 'running', offset: 0.5 });
+  assert.ok(over15.warnings.some(w => /lippage/.test(w)));
+  const atThird = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 24 }, grout: 0.125, pattern: 'running', offset: 1 / 3 });
+  assert.ok(!atThird.warnings.some(w => /lippage/.test(w)), '33% exactly is not "above 33 percent"');
+  const overThird = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 24 }, grout: 0.125, pattern: 'running', offset: 0.34 });
+  assert.ok(overThird.warnings.some(w => /lippage/.test(w)));
+  return 'no warning at 15"/50%, warning above; no warning at 1/3 offset, warning above';
+});
+
+test('grout warning boundary: exactly 1/8" on non-rectified does not warn', '1/8" vs 1/16" less on non-rectified tile', () => {
+  const ok = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 12, rectified: false }, grout: 0.125, pattern: 'stack' });
+  assert.ok(!ok.warnings.some(w => /non-rectified/.test(w)));
+  const tight = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 12, rectified: false }, grout: 0.124, pattern: 'stack' });
+  assert.ok(tight.warnings.some(w => /non-rectified/.test(w)));
+  return 'no warning at 1/8" exactly, warning just under it';
+});
+
+test('movement-joint warning: only when a full tile is actually flush to a wall', '120.5x144.5 leaves 1/4"+ everywhere vs an exact-fit room', () => {
+  const clear = computeLayout({ room: { width: 120.5, height: 144.5 }, tile: { width: 12, height: 24 }, grout: 0.1875, pattern: 'stack' });
+  assert.ok(!clear.warnings.some(w => /movement joint/.test(w)));
+  const flush = computeLayout({ room: { width: 121.25, height: 97 }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'stack' });
+  assert.ok(flush.warnings.some(w => /movement joint/.test(w)));
+  return 'no warning with clearance, warning when full tiles sit flush';
+});
+
 test('opposite walls equal across a sweep of rooms and patterns', '18 rooms x stack, running 50%, running 33% x 2 tiles x 2 focal walls', () => {
   let n = 0;
   for (const w of [37, 60, 96.5, 110, 121.25, 144]) {
@@ -397,6 +439,25 @@ test('opposite walls equal across a sweep of rooms and patterns', '18 rooms x st
     }
   }
   return `${n} layouts, opposite walls equal in every one, C in [M/2, M) after every half shift`;
+});
+
+test('odd running-bond offsets stay symmetric and fast (not just nice fractions)', 'offsets 10%..48% x 3 rooms, 12x24 tile', () => {
+  // offsetFraction() snaps 0.5, 1/3, etc. exactly, but a setter can dial in
+  // any percentage. An offset like 0.42 reduces to 21/50, which could blow up
+  // the shift search (it tries 2q candidate shifts per span) or leave the
+  // symmetric-wall invariant unchecked for the untidy fractions.
+  const t0 = Date.now();
+  let n = 0;
+  for (const offset of [0.1, 0.15, 0.2, 0.25, 0.28, 0.3, 0.35, 0.4, 0.42, 0.45, 0.48]) {
+    for (const [w, h] of [[110, 97], [144, 120], [73.5, 61.25]]) {
+      const r = computeLayout({ room: { width: w, height: h }, tile: { width: 12, height: 24 }, grout: 0.125, pattern: 'running', offset, focalWall: 'north' });
+      assertOppositeWallsEqual(r);
+      n++;
+    }
+  }
+  const ms = Date.now() - t0;
+  assert.ok(ms < 5000, `offset sweep took ${ms}ms, too slow for odd denominators`);
+  return `${n} layouts across 11 offsets including 0.42 (21/50), all symmetric, ${ms}ms`;
 });
 
 // ---------------------------------------------------------------------------

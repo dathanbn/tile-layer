@@ -825,7 +825,11 @@ function layoutDiagonal(ctx, tx, ty, orientation) {
         const quad = [rot.toWorld(u0, v0), rot.toWorld(u0 + tx, v0), rot.toWorld(u0 + tx, v0 + ty), rot.toWorld(u0, v0 + ty)];
         const ev = evaluateQuad(quad, rot.toLocal, room, tx, ty);
         if (!ev) continue;
-        cells.push({ shape: 'quad', points: quad, u0, v0, row: l, col: k, ...ev });
+        const xs = quad.map(p => p.x), ys = quad.map(p => p.y);
+        // bbox min/max double as each wall's true nearest-point distance, since
+        // the closest point of any polygon to an axis-aligned line is at its bbox edge.
+        const bbox = { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
+        cells.push({ shape: 'quad', points: quad, u0, v0, row: l, col: k, ...bbox, ...ev });
       }
     }
     return cells;
@@ -989,8 +993,12 @@ function finishLayout(ctx, cells, tx, ty, orientation, extra) {
   let allowancePct = (pattern === 'diagonal' || pattern === 'herringbone') ? 15 : 10;
   const extraCornersPct = room.corners > 4 ? 5 : 0;
   allowancePct += extraCornersPct;
-  const sqFtToBuy = fieldSqFt * (1 + allowancePct / 100);
-  const tilesToBuy = Math.ceil(sqFtToBuy * 144 / tileArea - 1e-9);
+  const flatAllowanceTiles = (fieldSqFt * (1 + allowancePct / 100) * 144) / tileArea;
+  // The flat allowance is a rule of thumb; it must never recommend fewer tiles
+  // than the engine's own count of what this exact layout consumes (full
+  // tiles plus what the cut pieces use once same-size offcuts are reused).
+  const tilesToBuy = Math.ceil(Math.max(flatAllowanceTiles, tilesUsed) - 1e-9);
+  const sqFtToBuy = (tilesToBuy * tileArea) / 144;
   const boxes = ctx.tilesPerBox ? Math.ceil(tilesToBuy / ctx.tilesPerBox - 1e-9) : null;
 
   // warnings
