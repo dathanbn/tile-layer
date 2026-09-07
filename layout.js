@@ -560,6 +560,10 @@ function evaluateRect(rect, room, tileW, tileH) {
   return {
     full, cutType, area,
     piece: { width: bw, height: bh, area, shape: notched ? 'notched' : 'rect', minDim },
+    // the clipped piece's own bounding box, for drawing — equals the full
+    // tile rect when nothing was cut away; a rectangle superset of the true
+    // shape on the rare notched (L-shape inner corner) tile
+    bbox: { x0: bbox.x0, y0: bbox.y0, x1: bbox.x1, y1: bbox.y1 },
     wallCuts, obstacles,
     offcut: full ? 0 : tileArea - area,
   };
@@ -615,6 +619,9 @@ function evaluateQuad(quad, toLocal, room, tileW, tileH) {
     piece: { width: bw, height: bh, area, shape: full ? 'rect' : 'polygon', minDim: Math.min(bw, bh) },
     wallCuts: wallsHit.map(w => ({ wall: w.name, dim: null })),
     obstacles,
+    // the exact clipped shape in world coordinates, for drawing — one convex
+    // polygon per room cell the tile overlaps (almost always exactly one)
+    worldPieces: pieces,
     offcut: full ? 0 : tileArea - area,
   };
 }
