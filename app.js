@@ -1,5 +1,5 @@
-import { computeLayout, measurement, formatFeetInches } from './layout.js';
-import { renderPlan } from './draw.js';
+import { computeLayout, measurement, formatFeetInches, rectangle, lShape } from './layout.js';
+import { renderPlan, renderRoomPreview } from './draw.js';
 
 const BOX_PIECES = 8;
 const LEFT_OF = { north: 'west', south: 'east', east: 'north', west: 'south' };
@@ -11,7 +11,7 @@ const NOTCH_CORNER = { north: 'southeast', south: 'northwest', east: 'southwest'
 let state = {
   screen: 'space', method: 'type', shape: 'rect',
   wFt: 10, wIn: 0, lFt: 12, lIn: 0, nWFt: 4, nLFt: 5,
-  focal: 'north', obstacles: [],
+  focal: 'north', obstacles: [], selectedObstacle: null,
   desc: '', parsed: null, parseFailed: false,
   tileW: 24, tileL: 12, thick: 0.375, rectified: true, grout: 0.125,
   pattern: 'running', offset: 0, offsetKind: 'half',
@@ -49,29 +49,34 @@ function offsetPatternFor(kind) {
 function isSquare(s) { return Math.max(s.tileW, s.tileL) / Math.min(s.tileW, s.tileL) < 1.4; }
 
 /**
- * The design has no UI to place an obstacle on the floor — only its size
- * and a label ("tile stops at its edge"). Until that control exists, lay
- * added obstacles out in a centered row so the geometry and warnings have
- * something real to clip against; this is a placement approximation, not
- * a real feature.
+ * Obstacles now carry a real (x, y) — set when added (centered, staggered)
+ * and moved by tapping the room preview on the Space screen. Clamp at read
+ * time in case the room shrank since it was placed.
  */
-function placeObstacles(obstacles, w, h) {
-  if (!obstacles.length) return [];
-  const gap = 12;
-  const totalW = obstacles.reduce((s, o) => s + o.w, 0) + gap * (obstacles.length - 1);
-  let x = Math.max(6, (w - totalW) / 2);
-  return obstacles.map(o => {
-    const ox = Math.max(6, Math.min(Math.max(6, w - o.w - 6), x));
-    const oy = Math.max(6, Math.min(Math.max(6, h - o.d - 6), (h - o.d) / 2));
-    x += o.w + gap;
-    return { x: ox, y: oy, width: o.w, height: o.d, label: o.label };
-  });
+function placedObstacles(obstacles, w, h) {
+  return obstacles.map(o => ({
+    x: Math.max(0, Math.min(o.x, Math.max(0, w - o.w))),
+    y: Math.max(0, Math.min(o.y, Math.max(0, h - o.d))),
+    width: o.w, height: o.d, label: o.label,
+  }));
+}
+
+function notchDims(s, width, height) {
+  return { width: Math.min(s.nWFt * 12, width - 1), height: Math.min(s.nLFt * 12, height - 1), corner: NOTCH_CORNER[s.focal] };
+}
+
+/** The room outline as drawable points — same shape computeLayout() sees. */
+function roomPolygon(s) {
+  const width = W(s), height = L(s);
+  if (s.shape !== 'ell') return rectangle(width, height);
+  const n = notchDims(s, width, height);
+  return lShape(width, height, n.width, n.height, n.corner);
 }
 
 function calc(s) {
   const width = W(s), height = L(s);
   const room = s.shape === 'ell'
-    ? { width, height, notch: { width: Math.min(s.nWFt * 12, width - 1), height: Math.min(s.nLFt * 12, height - 1), corner: NOTCH_CORNER[s.focal] } }
+    ? { width, height, notch: notchDims(s, width, height) }
     : { width, height };
   const offsetPct = off(s);
   const result = computeLayout({
@@ -82,7 +87,7 @@ function calc(s) {
     offset: s.pattern === 'running' ? Math.abs(offsetPct) / 100 : 0,
     offsetPattern: offsetPatternFor(s.offsetKind),
     focalWall: s.focal,
-    obstacles: placeObstacles(s.obstacles, width, height),
+    obstacles: placedObstacles(s.obstacles, width, height),
     tilesPerBox: BOX_PIECES,
   });
   const Lo = result.layout;
@@ -352,14 +357,49 @@ function screenSpace(s, c) {
     <div class="mono-note">tile stops here</div>
   </div>
   <div style="display:flex; gap:8px; flex-wrap:wrap;">
-    ${[['Island', 72, 36], ['Column', 12, 12], ['Hearth', 54, 20]].map(([label, w, d]) => `<button class="obstacle-chip" data-act="${act(() => setState(st => ({ obstacles: [...st.obstacles, { label, w, d, id: Math.random() }] })))}">+ ${label}</button>`).join('')}
+    ${[['Island', 72, 36], ['Column', 12, 12], ['Hearth', 54, 20]].map(([label, w, d]) => `<button class="obstacle-chip" data-act="${act(() => addObstacle(label, w, d))}">+ ${label}</button>`).join('')}
   </div>
-  ${s.obstacles.map(o => `<div class="obstacle-row">
+  ${s.obstacles.map(o => `<div class="obstacle-row${s.selectedObstacle === o.id ? ' selected' : ''}" data-act="${act(() => setState({ selectedObstacle: o.id }))}">
     <div class="obstacle-swatch"></div>
     <div style="flex:1;"><div class="name">${esc(o.label)}</div><div class="size">${o.w}" × ${o.d}" — tile stops at its edge</div></div>
-    <button data-act="${act(() => setState(st => ({ obstacles: st.obstacles.filter(x => x.id !== o.id) })))}">×</button>
-  </div>`).join('')}`;
+    <button data-act="${act(() => setState(st => {
+      const obstacles = st.obstacles.filter(x => x.id !== o.id);
+      return { obstacles, selectedObstacle: st.selectedObstacle === o.id ? (obstacles[0] && obstacles[0].id) : st.selectedObstacle };
+    }))}">×</button>
+  </div>`).join('')}
+  ${s.obstacles.length ? `<div style="margin-top:12px;">
+    <div class="mono-note" style="margin-bottom:6px;">tap the plan to place the selected obstacle — ${esc((s.obstacles.find(o => o.id === s.selectedObstacle) || s.obstacles[0]).label)}</div>
+    <div class="drawing-frame" style="margin-top:0;">
+      <div class="drawing-body" id="room-preview" style="cursor:crosshair;"></div>
+    </div>
+  </div>` : ''}`;
   return html;
+}
+
+function pickObstaclePoint(x, y) {
+  setState(st => {
+    const id = st.selectedObstacle ?? (st.obstacles[0] && st.obstacles[0].id);
+    if (id == null) return {};
+    const width = W(st), height = L(st);
+    const obstacles = st.obstacles.map(o => o.id !== id ? o : {
+      ...o,
+      x: Math.max(0, Math.min(width - o.w, x - o.w / 2)),
+      y: Math.max(0, Math.min(height - o.d, y - o.d / 2)),
+    });
+    return { obstacles, selectedObstacle: id };
+  });
+}
+
+function addObstacle(label, w, d) {
+  setState(st => {
+    const width = W(st), height = L(st);
+    const n = st.obstacles.length;
+    const stagger = 14 * n;
+    const x = Math.max(0, Math.min(width - w, (width - w) / 2 + stagger));
+    const y = Math.max(0, Math.min(height - d, (height - d) / 2 + stagger));
+    const id = Math.random();
+    return { obstacles: [...st.obstacles, { label, w, d, id, x, y }], selectedObstacle: id };
+  });
 }
 
 function screenTile(s, c) {
@@ -654,6 +694,10 @@ function render() {
   }
   if (s.screen === 'plan') {
     renderPlan(document.getElementById('plan-drawing'), c.result);
+  }
+  if (s.screen === 'space' && s.obstacles.length) {
+    const selected = s.selectedObstacle ?? s.obstacles[0].id;
+    renderRoomPreview(document.getElementById('room-preview'), roomPolygon(s), s.obstacles, selected, pickObstaclePoint);
   }
 }
 

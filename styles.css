@@ -144,7 +144,8 @@ h1.title { font-size: 26px; font-weight: 800; letter-spacing: -0.02em; margin: 0
 .wall-btn.on { background: var(--ink); color: #fff; border-color: var(--ink); }
 
 .obstacle-chip { border: 1px dashed var(--muted-3); background: transparent; color: var(--ink); padding: 11px 14px; border-radius: 2px; font-size: 14px; font-weight: 600; }
-.obstacle-row { display: flex; align-items: center; gap: 12px; background: #fff; border: 1px solid var(--hairline); border-radius: 2px; padding: 12px 14px; margin-top: 10px; }
+.obstacle-row { display: flex; align-items: center; gap: 12px; background: #fff; border: 1px solid var(--hairline); border-radius: 2px; padding: 12px 14px; margin-top: 10px; width: 100%; text-align: left; }
+.obstacle-row.selected { border-color: var(--blue); box-shadow: inset 0 0 0 1px var(--blue); }
 .obstacle-swatch { width: 10px; height: 10px; background: var(--red); flex: none; }
 .obstacle-row .name { font-size: 14px; font-weight: 700; }
 .obstacle-row .size { font-family: var(--mono); font-size: 12px; color: var(--muted-3); }

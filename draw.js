@@ -122,3 +122,48 @@ export function renderPlan(container, result) {
   container.innerHTML = '';
   container.appendChild(svg);
 }
+
+/**
+ * renderRoomPreview(container, polygon, obstacles, selectedId, onPick)
+ *   polygon     the room outline (array of {x,y}, inches) — no tiles yet,
+ *               this runs on the Space screen before a tile is even picked
+ *   obstacles   [{ id, label, x, y, w, d }] in room inches
+ *   selectedId  which obstacle a tap should move
+ *   onPick(x, y)  called with the tapped point in room inches
+ */
+export function renderRoomPreview(container, polygon, obstacles, selectedId, onPick) {
+  if (!container) return;
+  const width = Math.max(...polygon.map(p => p.x));
+  const height = Math.max(...polygon.map(p => p.y));
+  const pad = Math.max(6, Math.min(width, height) * 0.08);
+  const vbX = -pad, vbY = -pad, vbW = width + pad * 2, vbH = height + pad * 2;
+  const svg = svgEl('svg', {
+    viewBox: `${vbX} ${vbY} ${vbW} ${vbH}`, preserveAspectRatio: 'xMidYMid meet',
+    width: '100%', height: '100%', style: 'display:block;',
+  });
+
+  svg.appendChild(svgEl('polygon', { points: polygonPoints(polygon), fill: '#F4F5F2' }));
+
+  for (const o of obstacles) {
+    const selected = o.id === selectedId;
+    svg.appendChild(svgEl('rect', {
+      x: o.x, y: o.y, width: o.w, height: o.d,
+      fill: selected ? '#C8462A' : '#D98A73',
+      stroke: selected ? '#15181B' : 'none', 'stroke-width': 1.5, style: NON_SCALING,
+    }));
+  }
+
+  svg.appendChild(svgEl('polygon', {
+    points: polygonPoints(polygon), fill: 'none', stroke: '#15181B', 'stroke-width': 1.5, style: NON_SCALING,
+  }));
+
+  svg.addEventListener('click', (e) => {
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX; pt.y = e.clientY;
+    const loc = pt.matrixTransform(svg.getScreenCTM().inverse());
+    onPick(loc.x, loc.y);
+  });
+
+  container.innerHTML = '';
+  container.appendChild(svg);
+}
