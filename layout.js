@@ -366,6 +366,40 @@ export function centerAxis(roomDim, tileDim, grout) {
   return { M, n, R, C, threshold, shifted, exact, singlePiece, origin, cutPiece, wallGap, roomDim, tileDim, grout };
 }
 
+/**
+ * The course-to-course shift sequence for running bond, as a function of
+ * row index r. `offsetFrac` is the resolved {p, q, value} fraction of a
+ * module. Three shapes:
+ *
+ *   drift     (default) — shift accumulates by offset every row, mod M:
+ *             r*offset*M mod M. At offset = 1/q this repeats every q rows,
+ *             climbing the same direction each time ("staircase").
+ *   alternate — plain two-row bond regardless of q: row parity alone
+ *               decides unshifted vs shifted by offset. This is the
+ *               ordinary meaning of "running bond at X% offset" for any X.
+ *   zigzag    — steps out by Mr/q each row up to q-1 steps, then back down
+ *               to 0, a triangle wave of period 2(q-1). At q = 3 (1/3
+ *               offset) this is the 0, 1, 2, 1 course-shift bounce.
+ */
+export function rowShiftFn(offsetFrac, Mr, pattern = 'drift') {
+  const q = offsetFrac.q;
+  if (pattern === 'alternate') {
+    return (r) => mod(r, 2) * offsetFrac.value * Mr;
+  }
+  if (pattern === 'zigzag') {
+    const amplitude = q - 1;
+    if (amplitude <= 0) return () => 0;
+    const period = 2 * amplitude;
+    const step = Mr / q;
+    return (r) => {
+      const cyc = mod(r, period);
+      const triangle = cyc <= amplitude ? cyc : period - cyc;
+      return triangle * step;
+    };
+  }
+  return (r) => mod(r * offsetFrac.value * Mr, Mr);
+}
+
 /** Snap an offset like 0.33 to 1/3 so the row cycle is exact. */
 function offsetFraction(offset) {
   for (let q = 1; q <= 6; q++) {
@@ -526,6 +560,10 @@ function evaluateRect(rect, room, tileW, tileH) {
   return {
     full, cutType, area,
     piece: { width: bw, height: bh, area, shape: notched ? 'notched' : 'rect', minDim },
+    // the clipped piece's own bounding box, for drawing — equals the full
+    // tile rect when nothing was cut away; a rectangle superset of the true
+    // shape on the rare notched (L-shape inner corner) tile
+    bbox: { x0: bbox.x0, y0: bbox.y0, x1: bbox.x1, y1: bbox.y1 },
     wallCuts, obstacles,
     offcut: full ? 0 : tileArea - area,
   };
@@ -581,6 +619,9 @@ function evaluateQuad(quad, toLocal, room, tileW, tileH) {
     piece: { width: bw, height: bh, area, shape: full ? 'rect' : 'polygon', minDim: Math.min(bw, bh) },
     wallCuts: wallsHit.map(w => ({ wall: w.name, dim: null })),
     obstacles,
+    // the exact clipped shape in world coordinates, for drawing — one convex
+    // polygon per room cell the tile overlaps (almost always exactly one)
+    worldPieces: pieces,
     offcut: full ? 0 : tileArea - area,
   };
 }
@@ -669,7 +710,7 @@ function layoutGrid(ctx, tx, ty, orientation) {
   const lFocal = focalAtStart ? lFirst : lLast;
   const rowIndex = (l) => (focalAtStart ? l - lFocal : lFocal - l);
   const Mr = tileRow + grout;
-  const rowShift = (r) => mod(r * offsetFrac.value * Mr, Mr);
+  const rowShift = rowShiftFn(offsetFrac, Mr, ctx.offsetPattern);
   const rowsTouching = (w) => {
     const rows = [];
     const lo = Math.floor((w.from - across.origin) / Ma) - 1;
@@ -763,7 +804,7 @@ function layoutGrid(ctx, tx, ty, orientation) {
   axes[acrossAxis] = axisReport(across, acrossAxis, room, tileAcross, grout, null);
   return finishLayout(ctx, cells, tx, ty, orientation, {
     axes, lines: [lineA, lineB], start: startHere,
-    rows: { axis: rowAxis, parallelTo: focalWall, shiftPerCourse: measurement(offsetFrac.value * Mr), offset: offsetFrac.value },
+    rows: { axis: rowAxis, parallelTo: focalWall, shiftPerCourse: measurement(offsetFrac.value * Mr), offset: offsetFrac.value, pattern: pattern === 'running' ? (ctx.offsetPattern || 'drift') : null },
   });
 }
 
@@ -825,7 +866,11 @@ function layoutDiagonal(ctx, tx, ty, orientation) {
         const quad = [rot.toWorld(u0, v0), rot.toWorld(u0 + tx, v0), rot.toWorld(u0 + tx, v0 + ty), rot.toWorld(u0, v0 + ty)];
         const ev = evaluateQuad(quad, rot.toLocal, room, tx, ty);
         if (!ev) continue;
-        cells.push({ shape: 'quad', points: quad, u0, v0, row: l, col: k, ...ev });
+        const xs = quad.map(p => p.x), ys = quad.map(p => p.y);
+        // bbox min/max double as each wall's true nearest-point distance, since
+        // the closest point of any polygon to an axis-aligned line is at its bbox edge.
+        const bbox = { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
+        cells.push({ shape: 'quad', points: quad, u0, v0, row: l, col: k, ...bbox, ...ev });
       }
     }
     return cells;
@@ -989,12 +1034,18 @@ function finishLayout(ctx, cells, tx, ty, orientation, extra) {
   let allowancePct = (pattern === 'diagonal' || pattern === 'herringbone') ? 15 : 10;
   const extraCornersPct = room.corners > 4 ? 5 : 0;
   allowancePct += extraCornersPct;
-  const sqFtToBuy = fieldSqFt * (1 + allowancePct / 100);
-  const tilesToBuy = Math.ceil(sqFtToBuy * 144 / tileArea - 1e-9);
+  const flatAllowanceTiles = (fieldSqFt * (1 + allowancePct / 100) * 144) / tileArea;
+  // The flat allowance is a rule of thumb; it must never recommend fewer tiles
+  // than the engine's own count of what this exact layout consumes (full
+  // tiles plus what the cut pieces use once same-size offcuts are reused).
+  const tilesToBuy = Math.ceil(Math.max(flatAllowanceTiles, tilesUsed) - 1e-9);
+  const sqFtToBuy = (tilesToBuy * tileArea) / 144;
   const boxes = ctx.tilesPerBox ? Math.ceil(tilesToBuy / ctx.tilesPerBox - 1e-9) : null;
 
-  // warnings
-  const warnings = [];
+  // warnings. Each carries a code as well as its sentence, so the ranking
+  // can tell a layout that will lay wrong from one that merely costs more.
+  const notes = [];
+  const warn = (code, text) => notes.push({ code, text });
   const slivers = cuts.filter(c => c.piece.minDim < SLIVER - 1e-9);
   if (slivers.length) {
     const worst = slivers.reduce((b, c) => (c.piece.minDim < b.piece.minDim ? c : b));
@@ -1003,14 +1054,14 @@ function finishLayout(ctx, cells, tx, ty, orientation, extra) {
     const where = [];
     if (wallNames.length) where.push(`on the ${joinNames(wallNames)} wall${wallNames.length > 1 ? 's' : ''}`);
     if (obstacleNames.length) where.push(`against the ${joinNames(obstacleNames)}`);
-    warnings.push(`A cut only ${formatInches(worst.piece.minDim)} wide lands ${where.join(' and ')} (${slivers.length} piece${slivers.length > 1 ? 's' : ''} under ${SLIVER}"). Slivers that thin snap on the saw and read as a mistake. Try the other tile orientation or a different offset before you commit.`);
+    warn('sliver', `A cut only ${formatInches(worst.piece.minDim)} wide lands ${where.join(' and ')} (${slivers.length} piece${slivers.length > 1 ? 's' : ''} under ${SLIVER}"). Slivers that thin snap on the saw and read as a mistake. Try the other tile orientation or a different offset before you commit.`);
   }
   const longSide = Math.max(tile.width, tile.height);
   if (pattern === 'running' && ctx.offset > 1 / 3 + 1e-6 && longSide > 15) {
-    warnings.push(`A ${Math.round(ctx.offset * 100)}% offset on a ${formatInches(longSide)} tile risks lippage: large-format tile crowns in the middle, and a half offset puts the high point of one tile against the low edge of its neighbour. Use a 33% offset or less.`);
+    warn('lippage', `A ${Math.round(ctx.offset * 100)}% offset on a ${formatInches(longSide)} tile risks lippage: large-format tile crowns in the middle, and a half offset puts the high point of one tile against the low edge of its neighbour. Use a 33% offset or less.`);
   }
   if (grout < 0.125 - 1e-9 && !tile.rectified) {
-    warnings.push(`A ${formatInches(grout)} joint is too tight for a non-rectified tile. Cushion-edge tile varies in size and needs a 1/8" joint or wider to absorb it.`);
+    warn('tightJoint', `A ${formatInches(grout)} joint is too tight for a non-rectified tile. Cushion-edge tile varies in size and needs a 1/8" joint or wider to absorb it.`);
   }
   const tightWalls = [];
   for (const w of room.walls) {
@@ -1030,10 +1081,10 @@ function finishLayout(ctx, cells, tx, ty, orientation, extra) {
   }
   if (tightWalls.length) {
     const g = Math.min(...tightWalls.map(t => t.gap));
-    warnings.push(`Full tiles land ${formatInches(g)} from the ${joinNames(tightWalls.map(t => t.wall))} wall${tightWalls.length > 1 ? 's' : ''}, which leaves no room for a perimeter movement joint. Hold the field back so there is at least ${formatInches(MIN_PERIMETER_GAP)} at every wall and fill it with flexible sealant, not grout; the baseboard will cover it.`);
+    warn('movementJoint', `Full tiles land ${formatInches(g)} from the ${joinNames(tightWalls.map(t => t.wall))} wall${tightWalls.length > 1 ? 's' : ''}, which leaves no room for a perimeter movement joint. Hold the field back so there is at least ${formatInches(MIN_PERIMETER_GAP)} at every wall and fill it with flexible sealant, not grout; the baseboard will cover it.`);
   }
   if (allowancePct > 20 + 1e-9 || actualPct > 20 + 1e-9) {
-    warnings.push(`Waste runs to ${Math.round(Math.max(allowancePct, actualPct))}% with this layout, above the 20% you would normally plan for. Check the other orientation and whether offcuts from one wall can finish the opposite wall.`);
+    warn('waste', `Waste runs to ${Math.round(Math.max(allowancePct, actualPct))}% with this layout, above the 20% you would normally plan for. Check the other orientation and whether offcuts from one wall can finish the opposite wall.`);
   }
   if ((pattern === 'diagonal' || pattern === 'herringbone') && cuts.length) {
     // no warning, but setters should know the count is a plan count
@@ -1054,7 +1105,8 @@ function finishLayout(ctx, cells, tx, ty, orientation, extra) {
     },
     waste: { allowancePct, patternPct: allowancePct - extraCornersPct, extraCornersPct, actualPct },
     purchase: { sqFtToBuy, tilesToBuy, tilesPerBox: ctx.tilesPerBox || null, boxes, tilesByCount: tilesUsed, tilesForCuts },
-    warnings,
+    warnings: notes.map(n => n.text),
+    warningCodes: notes.map(n => n.code),
     tiles: cells,
   };
 }
@@ -1092,6 +1144,118 @@ function countTilesForCuts(cuts, tx, ty, pattern) {
   return tiles;
 }
 
+// ============================================================================
+// Ease: how hard is this layout to actually lay?
+// ============================================================================
+
+/**
+ * The numbers that decide "easiest layout, fewest cut tiles", in the order a
+ * setter would weigh them. Every one is a count or an inch measurement taken
+ * off the finished layout, so two layouts are comparable no matter which
+ * pattern, orientation or offset produced them.
+ *
+ *   slivers      cuts under 2" — these snap on the saw and read as a mistake,
+ *                so any layout with fewer of them wins outright
+ *   defects      warnings that the finished floor will be wrong — lippage, or
+ *                a sliver — as opposed to warnings you answer by doing the job
+ *                properly. Never recommend a setup the app flags this way
+ *   cutTiles     the headline: every one is a trip to the wet saw
+ *   smallestCut  the narrowest piece; a wider worst cut is a calmer job
+ *   hardCuts     corner, notched and obstacle pieces — two cuts, not one,
+ *                and no second chance if the scribe is wrong
+ *   cutSizes     how many distinct piece widths; each one is a saw setting,
+ *                so three sizes of cut is three fences to set, not one
+ *   wastePct     tile bought against tile laid
+ */
+/**
+ * Only the warnings that mean this layout will be *wrong* when it is finished
+ * and cannot be fixed by technique. A movement-joint warning is an instruction
+ * — hold the field back — and a tight-joint one is about the grout, not the
+ * pattern; neither is a reason to lay the room a different way, and treating
+ * them as one lets a 54-cut diagonal outrank a 40-cut stack bond.
+ */
+const DEFECT_CODES = new Set(['sliver', 'lippage']);
+
+export function layoutEase(layout) {
+  const cuts = layout.tiles.filter(t => !t.full);
+  const sizes = new Set(cuts.map(c => roundSixteenth(c.piece.minDim + 1e-9)));
+  return {
+    slivers: cuts.filter(c => c.piece.minDim < SLIVER - 1e-9).length,
+    defects: (layout.warningCodes || []).filter(c => DEFECT_CODES.has(c)).length,
+    cutTiles: layout.counts.cut,
+    fullTiles: layout.counts.full,
+    smallestCut: layout.smallestCut ? layout.smallestCut.inches : Infinity,
+    hardCuts: layout.counts.corner + layout.counts.obstacle,
+    cutSizes: sizes.size,
+    wastePct: layout.waste.actualPct,
+  };
+}
+
+/**
+ * A difference smaller than these is noise, not a reason to change anything.
+ * The cut-tile gate is proportional as well as absolute: two cuts out of
+ * thirty is noise, two out of eight is a fifth of the cutting.
+ */
+const EASE_TOL = { cutTilesPct: 0.15, cutTiles: 2, cutSizes: 2, smallestCut: 0.5, wastePct: 0.5 };
+
+/**
+ * Compare two ease reports. Returns { winner: 'a' | 'b' | 'tie', reason }
+ * where reason names the one measure that actually decided it, so the caller
+ * can tell the user why rather than just handing them a verdict.
+ *
+ * The order is the setter's, not the accountant's. Slivers are disqualifying.
+ * Then the cut count, because every cut is a trip to the saw. Then the number
+ * of distinct cut sizes, because a layout that cuts more pieces at one fence
+ * setting beats one that cuts fewer at nine — this is what stops a
+ * herringbone with three fewer cuts from being called "easier" than a stack
+ * bond with two cut sizes. Corner and obstacle pieces, the width of the worst
+ * cut, and finally waste, which is only money.
+ */
+export function easeVerdict(a, b) {
+  const finite = (v) => (Number.isFinite(v) ? v : 1e6);
+  const win = (which, reason) => ({ winner: which, reason });
+  const lower = (x, y) => (x < y ? 'a' : 'b');
+  const fewer = (x, y, one, many) => `${one} (${Math.min(x, y)} against ${Math.max(x, y)} ${many})`;
+
+  if (a.slivers !== b.slivers) {
+    const n = Math.min(a.slivers, b.slivers), m = Math.max(a.slivers, b.slivers);
+    return win(lower(a.slivers, b.slivers), n === 0
+      ? `no cut under ${SLIVER}" (the other leaves ${m})`
+      : fewer(n, m, `fewer slivers under ${SLIVER}"`, 'slivers'));
+  }
+  if (a.defects !== b.defects) {
+    return win(lower(a.defects, b.defects), Math.min(a.defects, b.defects) === 0
+      ? 'nothing to warn about (the other trips a warning)'
+      : fewer(a.defects, b.defects, 'fewer warnings', 'warnings'));
+  }
+  const cutGate = Math.max(EASE_TOL.cutTiles, Math.min(a.cutTiles, b.cutTiles) * EASE_TOL.cutTilesPct);
+  if (Math.abs(a.cutTiles - b.cutTiles) > cutGate) {
+    return win(lower(a.cutTiles, b.cutTiles), fewer(a.cutTiles, b.cutTiles, 'fewer cut tiles', 'cuts'));
+  }
+  if (Math.abs(a.cutSizes - b.cutSizes) > EASE_TOL.cutSizes) {
+    return win(lower(a.cutSizes, b.cutSizes), fewer(a.cutSizes, b.cutSizes, 'fewer saw settings', 'sizes of cut'));
+  }
+  if (a.hardCuts !== b.hardCuts) {
+    return win(lower(a.hardCuts, b.hardCuts), fewer(a.hardCuts, b.hardCuts, 'fewer corner and obstacle pieces', 'of them'));
+  }
+  if (Math.abs(finite(a.smallestCut) - finite(b.smallestCut)) > EASE_TOL.smallestCut) {
+    return win(a.smallestCut > b.smallestCut ? 'a' : 'b',
+      `a wider narrowest cut (${formatInches(Math.max(a.smallestCut, b.smallestCut))} against ${formatInches(Math.min(a.smallestCut, b.smallestCut))})`);
+  }
+  if (Math.abs(a.wastePct - b.wastePct) > EASE_TOL.wastePct) {
+    return win(lower(a.wastePct, b.wastePct),
+      `less waste (${Math.min(a.wastePct, b.wastePct).toFixed(1)}% against ${Math.max(a.wastePct, b.wastePct).toFixed(1)}%)`);
+  }
+  // inside every tolerance: let the raw cut count break the tie, then call it even
+  if (a.cutTiles !== b.cutTiles) {
+    return win(lower(a.cutTiles, b.cutTiles), fewer(a.cutTiles, b.cutTiles, 'marginally fewer cuts', 'cuts'));
+  }
+  if (a.cutSizes !== b.cutSizes) {
+    return win(lower(a.cutSizes, b.cutSizes), fewer(a.cutSizes, b.cutSizes, 'one less saw setting', 'sizes of cut'));
+  }
+  return win('tie', 'the two come out the same');
+}
+
 function uniqueNames(list) {
   return [...new Set(list)];
 }
@@ -1109,7 +1273,7 @@ const PATTERNS = ['stack', 'running', 'diagonal', 'herringbone'];
 const WALLS = ['north', 'south', 'east', 'west'];
 
 /**
- * computeLayout({ room, tile, grout, pattern, offset, focalWall, obstacles, tilesPerBox })
+ * computeLayout({ room, tile, grout, pattern, offset, offsetPattern, focalWall, obstacles, tilesPerBox })
  *
  *   room       polygon in inches (array of {x,y} or [x,y]), or {width,height}
  *              or {width,height,notch:{width,height,corner}}
@@ -1117,6 +1281,15 @@ const WALLS = ['north', 'south', 'east', 'west'];
  *   grout      joint width in inches
  *   pattern    'stack' | 'running' | 'diagonal' | 'herringbone'
  *   offset     0..0.5, running bond only
+ *   offsetPattern  running bond only, default 'drift':
+ *     drift     — shift accumulates every row, mod a module (r*offset*M mod M).
+ *                 At offset = 1/q this climbs the same direction for q rows,
+ *                 then repeats ("staircase").
+ *     alternate — plain two-row bond regardless of offset: odd rows shift,
+ *                 even rows don't. The ordinary meaning of "X% offset".
+ *     zigzag    — steps out by M/q each row up to q-1 steps, then back down
+ *                 to 0 (a triangle wave). At offset = 1/3 this is the
+ *                 0, 1, 2, 1 course-shift bounce.
  *   focalWall  'north' | 'south' | 'east' | 'west'
  *   obstacles  [{ x, y, width, height, label }] in room inches (optional)
  *   tilesPerBox  number (optional) — enables the box count
@@ -1136,8 +1309,12 @@ export function computeLayout(input) {
   let offset = input.offset == null ? 0.5 : +input.offset;
   if (pattern !== 'running') offset = 0;
   if (offset < 0 || offset > 0.5) throw new Error('offset must be between 0 and 0.5');
+  const offsetPattern = input.offsetPattern || 'drift';
+  if (!['drift', 'alternate', 'zigzag'].includes(offsetPattern)) {
+    throw new Error("offsetPattern must be 'drift', 'alternate', or 'zigzag'");
+  }
   const room = analyzeRoom(input.room, input.obstacles);
-  const ctx = { room, tile, grout, pattern, offset, focalWall, tilesPerBox: input.tilesPerBox || null };
+  const ctx = { room, tile, grout, pattern, offset, offsetPattern, focalWall, tilesPerBox: input.tilesPerBox || null };
 
   const long = Math.max(tile.width, tile.height), short = Math.min(tile.width, tile.height);
   const square = near(long, short);
@@ -1152,6 +1329,7 @@ export function computeLayout(input) {
     else layout = layoutGrid(ctx, tx, ty, orientation);
     layout.longAxisAlong = longAlongX ? 'x' : 'y';
     layout.longAxisParallelTo = longAlongX ? 'north/south walls' : 'east/west walls';
+    layout.ease = layoutEase(layout);
     orientations[orientation] = layout;
   }
   const recommended = compareOrientations(orientations.parallel, orientations.perpendicular, square, pattern);
@@ -1173,24 +1351,149 @@ export function computeLayout(input) {
   };
 }
 
+// ============================================================================
+// The optimizer: search the settings the user left free
+// ============================================================================
+
+const TRY_OFFSETS = [0.5, 1 / 3, 0.25, 0.2];
+const TRY_OFFSET_PATTERNS = ['drift', 'alternate', 'zigzag'];
+const PATTERN_LABELS = { stack: 'stack bond', running: 'running bond', diagonal: '45° diagonal', herringbone: 'herringbone' };
+
+function variantLabel(v) {
+  if (v.pattern !== 'running') return PATTERN_LABELS[v.pattern];
+  const pct = `${Math.round(v.offset * 100)}%`;
+  // at a half-module offset the three course shapes are the same layout,
+  // so naming one of them would be a distinction without a difference
+  if (offsetFraction(v.offset).q <= 2) return `running bond, ${pct}`;
+  const kind = { drift: 'staircase', zigzag: 'zigzag', alternate: 'every other course' }[v.offsetPattern];
+  return `running bond, ${pct} ${kind}`;
+}
+
+function sameVariant(a, b) {
+  return a.pattern === b.pattern
+    && (a.pattern !== 'running' || (near(a.offset, b.offset, 1e-6) && a.offsetPattern === b.offsetPattern));
+}
+
+/**
+ * A strict lexicographic key in the same order easeVerdict weighs things, but
+ * with no tolerances, so it totally orders the list for display. easeVerdict
+ * still picks the winner: it is the one that knows a three-cut difference is
+ * not worth seven extra saw settings.
+ */
+function byRank(a, b) {
+  const key = (e) => [e.ease.slivers, e.ease.defects, e.ease.cutTiles, e.ease.cutSizes, e.ease.hardCuts, -Math.min(e.ease.smallestCut, 1e6), e.ease.wastePct];
+  const ka = key(a), kb = key(b);
+  for (let i = 0; i < ka.length; i++) if (Math.abs(ka[i] - kb[i]) > 1e-9) return ka[i] - kb[i];
+  return 0;
+}
+
+/**
+ * optimizeLayout(input, { variants | patterns, offsets, offsetPatterns })
+ *
+ * Runs the whole engine over every setting the user has not pinned down and
+ * ranks the results easiest-first. The room, tile, joint and focal wall are
+ * the user's facts and never change; the tile orientation is already chosen
+ * inside computeLayout, so what is left to search is the pattern (only if the
+ * caller passes more than one — a pattern is an aesthetic choice, not an
+ * optimization) and, for running bond, the offset and course shape.
+ *
+ * A caller with its own vocabulary of setups passes `variants` instead: a
+ * list of { pattern, offset, offsetPattern, ...anything else } objects. The
+ * extra fields come back untouched on the matching entry, so a UI can hand
+ * back whatever it needs to apply the winner in one tap, and nothing is ever
+ * recommended that the caller cannot actually express.
+ *
+ * Returns
+ *   ranked     every distinct variant, easiest first, winner at the head
+ *   best       ranked[0]
+ *   current    the entry matching the settings that came in
+ *   improved   true only when `best` beats `current` by more than noise
+ *   reason     what makes it better, or why the current one is already fine
+ *   note       one sentence for the UI
+ */
+export function optimizeLayout(input, options = {}) {
+  const basePattern = input.pattern || 'stack';
+  const patterns = options.patterns && options.patterns.length ? options.patterns : [basePattern];
+  for (const p of patterns) if (!PATTERNS.includes(p)) throw new Error(`pattern must be one of ${PATTERNS.join(', ')}`);
+  const offsets = options.offsets || TRY_OFFSETS;
+  const offsetPatterns = options.offsetPatterns || TRY_OFFSET_PATTERNS;
+
+  const baseOffset = input.offset == null ? 0.5 : +input.offset;
+  const current = { pattern: basePattern, offset: basePattern === 'running' ? baseOffset : 0, offsetPattern: input.offsetPattern || 'drift' };
+
+  // build the variant list, dropping the ones that are the same layout under a
+  // different name (at 50% all three course shapes coincide, and so on)
+  const variants = [];
+  const seen = new Map();
+  const add = (v) => {
+    const offset = v.pattern === 'running' ? (v.offset == null ? 0.5 : +v.offset) : 0;
+    const full = { offsetPattern: 'drift', ...v, offset };
+    const key = full.pattern !== 'running' ? full.pattern
+      // twelve courses is more than one full cycle of every shape we generate
+      : `running:${Array.from({ length: 12 }, (_, r) => rowShiftFn(offsetFraction(offset), 1, full.offsetPattern)(r).toFixed(6)).join(',')}`;
+    const already = seen.get(key);
+    if (already) {
+      // same layout under a second name: keep the first, but take any extra
+      // fields the caller attached, so the entry can still be applied by label
+      for (const [k, val] of Object.entries(full)) if (!(k in already)) already[k] = val;
+      return;
+    }
+    seen.set(key, full);
+    variants.push(full);
+  };
+  // the settings that came in always rank, so `current` is never missing
+  add(current);
+  if (options.variants) {
+    for (const v of options.variants) add(v);
+  } else {
+    for (const pattern of patterns) {
+      if (pattern !== 'running') { add({ pattern, offset: 0, offsetPattern: 'drift' }); continue; }
+      for (const offset of offsets) for (const offsetPattern of offsetPatterns) add({ pattern, offset, offsetPattern });
+    }
+  }
+
+  const ranked = variants.map((v) => {
+    const result = computeLayout({ ...input, pattern: v.pattern, offset: v.offset, offsetPattern: v.offsetPattern });
+    const layout = result.layout;
+    return {
+      ...v,
+      orientation: result.recommended,
+      label: v.label || variantLabel(v),
+      ease: layout.ease,
+      warnings: layout.warnings,
+      isCurrent: sameVariant(v, current),
+    };
+  }).sort(byRank);
+
+  // The list is ordered strictly, but the winner is decided head to head, so
+  // that a variant which is only marginally ahead on the first measure does
+  // not get called "best" when it loses on the ones underneath. Because those
+  // comparisons carry tolerances they are not quite transitive, so the winner
+  // is the one nothing beats rather than the survivor of a single pass, which
+  // would depend on the order the variants happened to arrive in. If the
+  // tolerances leave a cycle with no such entry, the strict ranking decides.
+  const unbeaten = ranked.find(e => ranked.every(o => o === e || easeVerdict(e.ease, o.ease).winner !== 'b'));
+  const best = unbeaten || ranked[0];
+  ranked.splice(ranked.indexOf(best), 1);
+  ranked.unshift(best);
+  const currentEntry = ranked.find(e => e.isCurrent);
+  const verdict = easeVerdict(best.ease, currentEntry.ease);
+  const improved = !best.isCurrent && verdict.winner === 'a';
+  const note = improved
+    ? `${best.label} lays easier here: ${verdict.reason}.`
+    : `Nothing on the list beats ${currentEntry.label} by enough to be worth changing.`;
+  return { ranked, best, current: currentEntry, improved, reason: verdict.reason, note };
+}
+
 function compareOrientations(par, perp, square, pattern) {
   if (square) return { better: 'parallel', note: 'Square tile: orientation makes no difference.' };
-  const sc = (l) => (l.smallestCut ? l.smallestCut.inches : Infinity);
-  const wasteDiff = par.waste.actualPct - perp.waste.actualPct;
-  let better, why;
-  if (Math.abs(wasteDiff) > 0.5) {
-    better = wasteDiff < 0 ? 'parallel' : 'perpendicular';
-    why = `less waste (${par.waste.actualPct.toFixed(1)}% parallel vs ${perp.waste.actualPct.toFixed(1)}% perpendicular)`;
-  } else if (Math.abs(sc(par) - sc(perp)) > 1 / 16) {
-    better = sc(par) > sc(perp) ? 'parallel' : 'perpendicular';
-    why = `a bigger smallest cut (${formatInches(sc(par))} parallel vs ${formatInches(sc(perp))} perpendicular)`;
-  } else if (par.counts.cut !== perp.counts.cut) {
-    better = par.counts.cut < perp.counts.cut ? 'parallel' : 'perpendicular';
-    why = `fewer cuts (${par.counts.cut} parallel vs ${perp.counts.cut} perpendicular)`;
-  } else {
-    better = 'parallel';
-    why = 'the two come out the same, so the long side runs with the long wall';
-  }
+  const verdict = easeVerdict(par.ease, perp.ease);
+  // A tie keeps the long side of the tile running with the long wall, which is
+  // what a setter would do without a reason to do otherwise.
+  const better = verdict.winner === 'b' ? 'perpendicular' : 'parallel';
+  const why = verdict.winner === 'tie'
+    ? 'the two come out the same, so the long side runs with the long wall'
+    : `${verdict.reason}`;
   if (pattern === 'herringbone') {
     return { better, note: `Herringbone runs tiles both ways, so orientation only mirrors the chevrons; ${better} comes out with ${why}.` };
   }
