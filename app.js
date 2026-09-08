@@ -1,5 +1,5 @@
-import { computeLayout, measurement, formatFeetInches, rectangle, lShape } from './layout.js';
-import { renderPlan, renderRoomPreview } from './draw.js';
+import { computeLayout, optimizeLayout, measurement, formatFeetInches, rectangle, lShape } from './layout.js';
+import { renderPlan, renderStepFigure, renderRoomPreview } from './draw.js';
 
 const BOX_PIECES = 8;
 const LEFT_OF = { north: 'west', south: 'east', east: 'north', west: 'south' };
@@ -102,6 +102,72 @@ function wallText(layout, wall) {
 }
 
 // ---------------------------------------------------------------------------
+// which setup lays easiest — layout.js ranks them, this decides what to offer
+// ---------------------------------------------------------------------------
+
+/**
+ * Every setup this app can actually apply, written in the app's own
+ * vocabulary. optimizeLayout() hands the extra fields back untouched on the
+ * winning entry, so "use this one" is a setState of exactly these keys and
+ * the optimizer can never recommend something the buttons cannot express.
+ */
+function setupVariants(s) {
+  const v = [
+    { pattern: 'stack', offsetKind: null, label: 'stack bond' },
+    { pattern: 'running', offset: 0.5, offsetPattern: 'alternate', offsetKind: 'half', label: 'running bond, 50%' },
+    { pattern: 'diagonal', offsetKind: null, label: '45° diagonal' },
+  ];
+  if (!isSquare(s)) {
+    v.push({ pattern: 'running', offset: 1 / 3, offsetPattern: 'zigzag', offsetKind: 'zigzag', label: 'running bond, 33% zigzag' });
+    v.push({ pattern: 'running', offset: 1 / 3, offsetPattern: 'drift', offsetKind: 'stair', label: 'running bond, 33% staircase' });
+    v.push({ pattern: 'herringbone', offsetKind: null, label: 'herringbone' });
+  }
+  // whatever the slider is on, so a custom offset is always in the running
+  if (s.pattern === 'running' && s.offsetKind === 'custom') {
+    const pct = Math.abs(off(s));
+    v.push({ pattern: 'running', offset: pct / 100, offsetPattern: 'alternate', offsetKind: 'custom', offsetValue: s.offset, label: `running bond, ${pct}% custom` });
+  }
+  return v;
+}
+
+// Ranking every setup means laying out the room once per setup, so hold the
+// answer until something that could change it changes.
+let rankCache = { key: null, value: null };
+
+function ranking(s) {
+  const key = JSON.stringify([
+    s.shape, s.wFt, s.wIn, s.lFt, s.lIn, s.nWFt, s.nLFt, s.focal,
+    s.tileW, s.tileL, s.rectified, s.grout, s.pattern, s.offsetKind, s.offset,
+    s.obstacles.map(o => [o.w, o.d, o.x, o.y]),
+  ]);
+  if (rankCache.key === key) return rankCache.value;
+  const width = W(s), height = L(s);
+  const value = optimizeLayout({
+    room: s.shape === 'ell' ? { width, height, notch: notchDims(s, width, height) } : { width, height },
+    tile: { width: s.tileW, height: s.tileL, rectified: s.rectified },
+    grout: s.grout,
+    pattern: s.pattern,
+    offset: s.pattern === 'running' ? Math.abs(off(s)) / 100 : 0,
+    offsetPattern: offsetPatternFor(s.offsetKind),
+    focalWall: s.focal,
+    obstacles: placedObstacles(s.obstacles, width, height),
+    tilesPerBox: BOX_PIECES,
+  }, { variants: setupVariants(s) });
+  rankCache = { key, value };
+  return value;
+}
+
+/** Apply a ranked entry: the fields it carried in are the fields to set. */
+function useSetup(entry) {
+  setState({
+    pattern: entry.pattern,
+    ...(entry.offsetKind ? { offsetKind: entry.offsetKind } : {}),
+    ...(entry.offsetKind === 'custom' ? { offset: entry.offsetValue } : {}),
+    step: 0,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // warnings — layout.js already writes plain-language strings
 // ---------------------------------------------------------------------------
 
@@ -117,12 +183,25 @@ function steps(s, c) {
   const Lo = c.layout;
   const wall = s.focal, opp = OPPOSITE[wall];
   const lineA = Lo.lines[0], lineB = Lo.lines[1];
+  // A diagonal layout's lines run corner to corner, so they have endpoints
+  // rather than an offset off a wall — asking for "0 inches from the north
+  // wall" would be nonsense. The engine's own sentence carries the detail.
+  const lineStep = (line, first) => {
+    const kicker = first ? 'first line' : 'second line';
+    const figure = first ? 'lineA' : 'lineB';
+    if (line.endpoints) {
+      return { kicker, figure, body: line.description, numLabel: '', numValue: '',
+        title: first ? 'Snap your first line at 45° across the room.' : 'Snap the second line at 45°, square to the first.' };
+    }
+    const from = line.from ?? (first ? wall : LEFT_OF[wall]);
+    const display = line.display ?? measurement(line.inches ?? 0).display;
+    return { kicker, figure, body: line.description, numLabel: `from the ${from} wall`, numValue: display,
+      title: first ? `Snap your first line ${display} from the ${from} wall.` : `Snap the cross line ${display} from the ${from} wall.` };
+  };
   const arr = [
-    { kicker: 'first line', title: `Snap your first line ${lineA.display ?? measurement(lineA.inches ?? 0).display} from the ${lineA.from ?? wall} wall.`,
-      body: lineA.description, numLabel: `from the ${lineA.from ?? wall} wall`, numValue: lineA.display ?? '' },
-    { kicker: 'second line', title: `Snap the cross line ${lineB.display ?? ''} from the ${lineB.from ?? LEFT_OF[wall]} wall.`,
-      body: lineB.description, numLabel: `from the ${lineB.from ?? LEFT_OF[wall]} wall`, numValue: lineB.display ?? '' },
-    { kicker: 'first tile', title: 'Set your first tile where the two lines cross.', body: Lo.start.description, numLabel: '', numValue: '' },
+    lineStep(lineA, true),
+    lineStep(lineB, false),
+    { kicker: 'first tile', figure: 'start', title: 'Set your first tile where the two lines cross.', body: Lo.start.description, numLabel: '', numValue: '' },
   ];
   const fieldBody = s.pattern === 'running'
     ? (s.offsetKind === 'stair'
@@ -132,7 +211,7 @@ function steps(s, c) {
         : `Shift every second course ${Lo.rows.shiftPerCourse.displayInches} — that is your ${Math.abs(off(s))}% offset. Back-butter, then set with a twist so the ridges collapse flat.`)
     : 'Keep joints continuous both directions. Back-butter, then set with a twist so the ridges collapse flat.';
   arr.push({
-    kicker: 'the field',
+    kicker: 'the field', figure: 'field',
     title: `Lay the field: ${Lo.counts.full} full tiles.`,
     body: fieldBody,
     numLabel: s.pattern === 'running' ? 'course shift' : 'full tiles',
@@ -141,16 +220,25 @@ function steps(s, c) {
   const sideWall = LEFT_OF[wall];
   const sideText = wallText(Lo, sideWall) || wallText(Lo, OPPOSITE[sideWall]) || '—';
   const endText = wallText(Lo, opp) || wallText(Lo, wall) || '—';
+  // A diagonal or herringbone field meets the wall at an angle, so there is no
+  // one repeated cut width to name — every piece is its own measurement.
+  const repeats = sideText !== '—' || endText !== '—';
   arr.push({
-    kicker: 'the cuts', title: `Cut the perimeter: ${sideText} at the side walls, ${endText} at the ${opp} wall.`,
-    body: 'Measure each one at the wall rather than trusting the plan — framing wanders. Leave a 1/4" gap at every wall for movement; the baseboard covers it.',
+    kicker: 'the cuts', figure: 'cuts',
+    title: repeats
+      ? `Cut the perimeter: ${sideText} at the side walls, ${endText} at the ${opp} wall.`
+      : `Cut the perimeter: ${Lo.counts.cut} pieces, no two the same.`,
+    body: repeats
+      ? 'Measure each one at the wall rather than trusting the plan — framing wanders. Leave a 1/4" gap at every wall for movement; the baseboard covers it.'
+      : 'The field meets the wall at an angle, so every piece is its own measurement. Cut them one at a time off the wall itself, and leave a 1/4" gap for movement; the baseboard covers it.',
     numLabel: 'cut tiles', numValue: String(Lo.counts.cut),
   });
   if (s.obstacles.length) {
-    arr.push({ kicker: 'obstacles', title: `Scribe around the ${s.obstacles.map(o => o.label.toLowerCase()).join(' and ')}.`,
-      body: 'Hold a full tile in place, mark the cut off the obstacle itself, and keep the joint lines running through as if it were not there.', numLabel: '', numValue: '' });
+    arr.push({ kicker: 'obstacles', figure: 'obstacles', title: `Scribe around the ${s.obstacles.map(o => o.label.toLowerCase()).join(' and ')}.`,
+      body: 'Hold a full tile in place, mark the cut off the obstacle itself, and keep the joint lines running through as if it were not there.',
+      numLabel: 'pieces to scribe', numValue: String(Lo.counts.obstacle) });
   }
-  arr.push({ kicker: 'before you grout', title: 'Wait 24 hours, then pull the spacers and check every joint.',
+  arr.push({ kicker: 'before you grout', figure: 'done', title: 'Wait 24 hours, then pull the spacers and check every joint.',
     body: 'Sound the field with a knuckle for hollow tiles while the thinset is still green enough to lift one.', numLabel: '', numValue: '' });
   return arr;
 }
@@ -629,9 +717,11 @@ function screenPlan(s, c) {
 
   <div class="buy-block">
     <div class="label">buy this</div>
-    <div class="row"><div class="count">${Lo.purchase.boxes}</div><div class="unit">boxes</div></div>
-    <div class="note">${BOX_PIECES} pieces a box, ${c.cover.toFixed(1)} sq ft each. That is ${(Lo.purchase.boxes * c.cover).toFixed(1)} sq ft on site against ${Lo.area.fieldSqFt.toFixed(1)} sq ft of floor — keep the offcuts until the job is signed off.</div>
+    <div class="row"><div class="count">${Lo.purchase.tilesToBuy}</div><div class="unit">piece${Lo.purchase.tilesToBuy === 1 ? '' : 's'}</div></div>
+    <div class="note">${Lo.counts.full} go down whole and ${Lo.counts.cut} come off the saw; the rest is the ${Lo.waste.allowancePct}% allowance. That is ${Lo.purchase.sqFtToBuy.toFixed(1)} sq ft against ${Lo.area.fieldSqFt.toFixed(1)} sq ft of floor. If the shop only sells full boxes of ${BOX_PIECES}, that is ${Lo.purchase.boxes} box${Lo.purchase.boxes === 1 ? '' : 'es'} — keep the offcuts until the job is signed off.</div>
   </div>
+
+  ${setupBlock(s, c)}
 
   ${warn.length ? `<div class="warning-strip">
     <div class="warning-head"><div class="title">Check these before you snap</div><div class="count">${warn.length} thing${warn.length > 1 ? 's' : ''}</div></div>
@@ -639,20 +729,84 @@ function screenPlan(s, c) {
   </div>` : ''}`;
 }
 
+/**
+ * The ranked setups, easiest first. Reads as a comparison rather than a
+ * verdict: the counts are all there, so a setter who wants the diagonal for
+ * how it looks can see exactly what it costs and take it anyway.
+ */
+function setupBlock(s, c) {
+  const rank = ranking(s);
+  const rows = rank.ranked.map((e) => {
+    const flags = [e.isCurrent ? 'now' : '', e === rank.best ? 'easiest' : ''].filter(Boolean);
+    // the trouble is what decides the order, so it has to be on the row —
+    // otherwise a setup with the fewest cuts sits low in the list for no
+    // visible reason
+    const trouble = e.ease.slivers
+      ? `<span class="bad"><b>${e.ease.slivers}</b> sliver${e.ease.slivers === 1 ? '' : 's'}</span>`
+      : e.ease.defects ? '<span class="bad">lippage risk</span>' : '';
+    return `<div class="setup-row${e.isCurrent ? ' now' : ''}${e === rank.best ? ' best' : ''}">
+      <div class="name">${esc(e.label)}${flags.length ? `<span class="flag">${flags.join(' · ')}</span>` : ''}</div>
+      <div class="figures">
+        <span><b>${e.ease.cutTiles}</b> cuts</span>
+        <span><b>${e.ease.cutSizes}</b> size${e.ease.cutSizes === 1 ? '' : 's'}</span>
+        <span><b>${e.ease.wastePct.toFixed(0)}%</b> waste</span>
+        ${trouble}
+      </div>
+    </div>`;
+  }).join('');
+  return `<div class="setup-block">
+    <div class="setup-head">
+      <div class="title">Easiest way to lay this</div>
+      <div class="mono-note">fewest cuts, then fewest saw settings</div>
+    </div>
+    ${rows}
+    <div class="setup-note">${esc(rank.note)}</div>
+    ${rank.improved ? `<button class="btn-outline-full" style="width:100%; margin-top:12px;" data-act="${act(() => useSetup(rank.best))}">Switch to ${esc(rank.best.label)}</button>` : ''}
+  </div>`;
+}
+
+// What the figure beside each instruction is showing, so the drawing is never
+// left to be interpreted.
+const FIGURE_CAPS = {
+  lineA: 'line A, and where it sits off the wall',
+  lineB: 'line B, square to A',
+  start: 'the first full tile, on the crossing',
+  field: 'the whole tiles, laid before any cutting',
+  cuts: 'the perimeter pieces, in red',
+  obstacles: 'the pieces that get scribed',
+  done: 'the finished floor',
+};
+
+/**
+ * Give the figure the room's own proportions so the drawing fills it, but keep
+ * it between a wide letterbox and a tall portrait — a 3ft x 30ft hallway drawn
+ * true to shape would be a hairline on a phone.
+ */
+function figureAspect(c) {
+  const pad = Math.min(c.W, c.L) * 0.16;
+  return Math.max(0.8, Math.min(2, (c.W + pad) / (c.L + pad))).toFixed(3);
+}
+
 function screenLay(s, c) {
   const stepList = steps(s, c);
   const step = stepList[Math.min(s.step, stepList.length - 1)];
-  return `<div class="lay-head"><h1 class="title" style="margin:0;">Lay it</h1><div class="mono-note" style="font-size:13px;">step ${Math.min(s.step, stepList.length - 1) + 1} of ${stepList.length}</div></div>
+  const idx = Math.min(s.step, stepList.length - 1);
+  return `<div class="lay-head"><h1 class="title" style="margin:0;">Lay it</h1><div class="mono-note" style="font-size:13px;">step ${idx + 1} of ${stepList.length}</div></div>
   <div class="tick-bar">${stepList.map((_, i) => `<div class="tick${i <= s.step ? ' done' : ''}"></div>`).join('')}</div>
   <div class="step-card">
     <div class="kicker">${step.kicker}</div>
     <div class="title">${esc(step.title)}</div>
+    <div class="step-figure">
+      <div class="figure-body" id="step-figure" style="aspect-ratio:${figureAspect(c)};"></div>
+      <div class="figure-cap">${esc(FIGURE_CAPS[step.figure] || '')}</div>
+    </div>
     <div class="body">${esc(step.body)}</div>
     ${step.numValue ? `<div class="num-block"><div class="num-label">${esc(step.numLabel)}</div><div class="num-value">${esc(step.numValue)}</div></div>` : ''}
   </div>
   <div class="all-steps-head">all steps</div>
   ${stepList.map((x, i) => `<button class="step-row" style="border-top:1px solid var(--hairline);" data-act="${act(() => setState({ step: i }))}">
     <div class="n" style="color:${i === s.step ? 'var(--blue)' : 'var(--disabled)'};">${i + 1}</div>
+    <div class="fig-mini" id="step-mini-${i}"></div>
     <div class="t" style="font-weight:${i === s.step ? '700' : '500'}; color:${i === s.step ? 'var(--ink)' : 'var(--muted-2)'};">${esc(x.title)}</div>
   </button>`).join('')}`;
 }
@@ -756,6 +910,14 @@ function render() {
   }
   if (s.screen === 'plan') {
     renderPlan(document.getElementById('plan-drawing'), c.result);
+  }
+  if (s.screen === 'lay') {
+    const stepList = steps(s, c);
+    const idx = Math.min(s.step, stepList.length - 1);
+    renderStepFigure(document.getElementById('step-figure'), c.result, stepList[idx].figure);
+    // the same drawing in miniature against every row, so the list reads as a
+    // sequence of pictures rather than a wall of sentences
+    stepList.forEach((x, i) => renderStepFigure(document.getElementById(`step-mini-${i}`), c.result, x.figure));
   }
   if (s.screen === 'space' && s.obstacles.length) {
     const selected = s.selectedObstacle ?? s.obstacles[0].id;

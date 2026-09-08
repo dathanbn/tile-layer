@@ -209,6 +209,32 @@ h1.title { font-size: 26px; font-weight: 800; letter-spacing: -0.02em; margin: 0
 .buy-block .unit { color: #fff; font-size: 16px; font-weight: 700; padding-bottom: 6px; }
 .buy-block .note { font-size: 13px; color: #C6CCD3; margin-top: 10px; line-height: 1.5; }
 
+/* ranked setups: a comparison, not a verdict */
+.setup-block { margin-top: 20px; border: 2px solid var(--ink); background: #fff; border-radius: 2px; padding: 0 0 16px; }
+.setup-head { padding: 13px 14px 12px; border-bottom: 1px solid var(--hairline-2); }
+.setup-head .title { font-size: 15px; font-weight: 800; letter-spacing: -0.01em; }
+.setup-head .mono-note { margin-top: 3px; }
+.setup-row { padding: 10px 14px; border-bottom: 1px solid var(--hairline); }
+.setup-row .name { font-size: 14px; font-weight: 600; color: var(--muted-2); line-height: 1.3; }
+.setup-row.best .name, .setup-row.now .name { color: var(--ink); font-weight: 700; }
+.setup-row.best { background: #F1F4FD; box-shadow: inset 3px 0 0 var(--blue); }
+.setup-row .flag { font-family: var(--mono); font-size: 10px; color: var(--blue); margin-left: 7px; text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap; }
+.setup-row.now:not(.best) .flag { color: var(--muted-3); }
+.setup-row .figures { display: flex; gap: 14px; margin-top: 4px; font-family: var(--mono); font-size: 11px; color: var(--muted-3); }
+.setup-row .figures b { font-weight: 600; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.setup-row .figures .bad, .setup-row .figures .bad b { color: var(--red); }
+.setup-note { font-size: 13px; line-height: 1.5; color: var(--muted); padding: 12px 14px 0; text-wrap: pretty; }
+.setup-block .btn-outline-full { margin-left: 14px; width: calc(100% - 28px) !important; }
+
+/* the drawing beside each lay-it instruction */
+/* the striped ground spans the frame; the drawing box inside takes the room's
+   own proportions (set inline, clamped) and centres, so a portrait room is not
+   a stamp in the middle of a letterbox and a wide one is not a hairline */
+.step-figure { margin-top: 16px; border: 1px solid var(--hairline-2); border-radius: 2px; overflow: hidden; background: repeating-linear-gradient(90deg,#F4F5F2 0 11px,#EDEFEA 11px 12px); }
+.step-figure .figure-body { aspect-ratio: 4/3; max-height: 300px; margin: 0 auto; display: flex; align-items: center; justify-content: center; padding: 10px; }
+.step-figure .figure-cap { font-family: var(--mono); font-size: 11px; color: var(--muted-3); padding: 8px 10px; border-top: 1px solid var(--hairline); background: #fff; }
+.step-row .fig-mini { width: 42px; height: 32px; flex: none; border: 1px solid var(--hairline-2); background: #F4F5F2; overflow: hidden; display: flex; align-items: center; justify-content: center; padding: 2px; }
+
 .warning-strip { margin-top: 20px; background: var(--red); border-radius: 2px; overflow: hidden; }
 .warning-head { padding: 13px 16px; border-bottom: 1px solid rgba(255,255,255,0.35); display: flex; justify-content: space-between; align-items: baseline; }
 .warning-head .title { color: #fff; font-size: 15px; font-weight: 800; }

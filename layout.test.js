@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict';
 import {
   computeLayout, centerAxis, roundSixteenth, formatInches, formatFeetInches, lShape, rowShiftFn,
+  layoutEase, easeVerdict, optimizeLayout,
 } from './layout.js';
 
 const rows = [];
@@ -491,6 +492,120 @@ test('odd running-bond offsets stay symmetric and fast (not just nice fractions)
   const ms = Date.now() - t0;
   assert.ok(ms < 5000, `offset sweep took ${ms}ms, too slow for odd denominators`);
   return `${n} layouts across 11 offsets including 0.42 (21/50), all symmetric, ${ms}ms`;
+});
+
+// ---------------------------------------------------------------------------
+// Optimizing for the easiest layout with the fewest cut tiles
+// ---------------------------------------------------------------------------
+
+test('ease report counts what makes a layout hard', '120x144 room, 12x24 tile, stack', () => {
+  const r = computeLayout({ room: { width: 120, height: 144 }, tile: { width: 12, height: 24 }, grout: 3 / 16, pattern: 'stack' });
+  const e = r.layout.ease;
+  assert.equal(e.cutTiles, r.layout.counts.cut, 'cutTiles tracks counts.cut');
+  assert.equal(e.fullTiles, r.layout.counts.full);
+  assert.equal(e.hardCuts, r.layout.counts.corner + r.layout.counts.obstacle);
+  assert.equal(e.slivers, 0, 'no sliver in the reference room');
+  assert.equal(e.cutSizes, 2, 'two saw settings: one per axis');
+  closeTo(e.smallestCut, r.layout.smallestCut.inches, 1e-9);
+  // every orientation carries one, so they can be compared directly
+  assert.ok(r.orientations.parallel.ease && r.orientations.perpendicular.ease);
+  return `slivers ${e.slivers}, ${e.cutTiles} cuts in ${e.cutSizes} sizes, smallest ${formatInches(e.smallestCut)}, waste ${e.wastePct.toFixed(1)}%`;
+});
+
+test('easeVerdict weighs slivers, then warnings, then cuts, then saw settings', 'hand-built ease reports', () => {
+  const base = { slivers: 0, defects: 0, cutTiles: 30, fullTiles: 40, smallestCut: 5, hardCuts: 4, cutSizes: 2, wastePct: 7 };
+  // a sliver loses however good the rest looks
+  assert.equal(easeVerdict({ ...base, slivers: 1, cutTiles: 10 }, base).winner, 'b', 'sliver must lose');
+  // so does a layout the engine warns about — never recommend what you flag
+  assert.equal(easeVerdict({ ...base, defects: 1, cutTiles: 20 }, base).winner, 'b', 'a warned layout must lose');
+  // a real cut-count gap wins: 30 against 44 is well past the 15% gate
+  assert.equal(easeVerdict(base, { ...base, cutTiles: 44 }).winner, 'a');
+  // two cuts out of thirty is noise, so it falls through to the later measures
+  assert.equal(easeVerdict(base, { ...base, cutTiles: 32 }).winner, 'a');
+  assert.equal(easeVerdict(base, { ...base, cutTiles: 32 }).reason.includes('marginally'), true);
+  // three fewer cuts does not buy seven more saw settings — the herringbone case
+  const tricky = easeVerdict({ ...base, cutTiles: 27, cutSizes: 9 }, base);
+  assert.equal(tricky.winner, 'b', 'fewer cuts at nine sizes is not easier than more cuts at two');
+  assert.ok(tricky.reason.includes('saw settings'), tricky.reason);
+  // identical reports tie
+  assert.equal(easeVerdict(base, { ...base }).winner, 'tie');
+  return `sliver and warning both lose outright; 30 vs 44 cuts decides; 30 vs 32 does not; 27 cuts/9 sizes loses to 30 cuts/2 sizes`;
+});
+
+test('the optimizer never recommends a setup the app warns about', '10x12 room, 24x12 tile, 1/8" joint — the app\'s own defaults', () => {
+  // a 50% offset on a 24" tile trips the lippage warning, and it is also the
+  // layout with the fewest cuts: the ranking has to prefer the quiet one
+  const input = { room: { width: 120, height: 144 }, tile: { width: 24, height: 12, rectified: true }, grout: 0.125, focalWall: 'north', pattern: 'running', offset: 0.5, offsetPattern: 'alternate' };
+  const half = computeLayout(input);
+  assert.ok(half.layout.warningCodes.includes('lippage'), 'the 50% offset really does trip lippage');
+  assert.equal(half.layout.ease.defects, 1);
+
+  const o = optimizeLayout(input, { patterns: ['stack', 'running', 'diagonal', 'herringbone'] });
+  assert.equal(o.improved, true, 'the default is not the setup to recommend');
+  assert.equal(o.best.ease.defects, 0, `recommended ${o.best.label} still trips ${JSON.stringify(o.best.warnings)}`);
+  // and it wins on the strength of that, not despite having more cuts
+  assert.ok(o.best.ease.cutTiles >= half.layout.counts.cut, 'the quiet setup here really does cut a little more');
+  const applied = computeLayout({ ...input, pattern: o.best.pattern, offset: o.best.offset, offsetPattern: o.best.offsetPattern });
+  assert.equal(applied.layout.warnings.length, 0, JSON.stringify(applied.layout.warnings));
+  return `${o.current.label} (${half.layout.counts.cut} cuts, lippage) gives way to ${o.best.label} (${o.best.ease.cutTiles} cuts, no warning)`;
+});
+
+test('orientation is chosen on cut count, not on waste', '96" x 140" room, 6x24 plank, 1/8" joint, stack', () => {
+  const r = computeLayout({ room: { width: 96, height: 140 }, tile: { width: 6, height: 24 }, grout: 0.125, pattern: 'stack' });
+  const p = r.orientations.parallel, q = r.orientations.perpendicular;
+  assert.equal(p.counts.cut, 44);
+  assert.equal(q.counts.cut, 54);
+  // perpendicular wastes less tile (4.3% against 8.2%) but cuts ten more
+  // pieces; ten cuts of a man's day beat four percent of the tile bill
+  assert.ok(q.waste.actualPct < p.waste.actualPct, 'perpendicular really is the lower-waste one');
+  assert.equal(r.recommended, 'parallel', 'the ten fewer cuts must win');
+  assert.ok(r.orientationNote.includes('fewer cut tiles'), r.orientationNote);
+  return `${r.recommended}: ${p.counts.cut} cuts at ${p.waste.actualPct.toFixed(1)}% waste beats ${q.counts.cut} at ${q.waste.actualPct.toFixed(1)}%`;
+});
+
+test('optimizeLayout ranks the settings the user left free', '120x144, 12x24, 3/16 joint, running bond at 20% zigzag', () => {
+  const input = { room: { width: 120, height: 144 }, tile: { width: 12, height: 24, rectified: true }, grout: 3 / 16, focalWall: 'north', pattern: 'running', offset: 0.2, offsetPattern: 'zigzag' };
+  const o = optimizeLayout(input);
+  assert.ok(o.ranked.length > 1, 'more than one variant');
+  assert.equal(o.ranked[0], o.best, 'the winner heads the list');
+  assert.equal(o.current.pattern, 'running');
+  closeTo(o.current.offset, 0.2, 1e-9);
+  assert.equal(o.current.offsetPattern, 'zigzag');
+  assert.equal(o.improved, true, 'a 20% zigzag is not the easiest way to run this room');
+  // every entry is a set of settings that can be handed straight back
+  const applied = computeLayout({ ...input, pattern: o.best.pattern, offset: o.best.offset, offsetPattern: o.best.offsetPattern });
+  assert.deepEqual(applied.layout.ease, o.best.ease, 'applying best reproduces the ease it promised');
+  // and it is genuinely no worse than what the user had
+  assert.ok(applied.layout.counts.cut <= o.current.ease.cutTiles);
+  assert.ok(applied.layout.ease.cutSizes <= o.current.ease.cutSizes);
+  return `${o.ranked.length} variants; best ${o.best.label} (${o.best.ease.cutTiles} cuts, ${o.best.ease.cutSizes} sizes) over ${o.current.label} (${o.current.ease.cutTiles} cuts, ${o.current.ease.cutSizes} sizes)`;
+});
+
+test('optimizeLayout drops variants that are the same layout twice', '12x12 tile, running bond; 50% is one layout, not three', () => {
+  const input = { room: { width: 120, height: 144 }, tile: { width: 12, height: 12 }, grout: 0.125, pattern: 'running', offset: 0.5 };
+  const o = optimizeLayout(input);
+  const halves = o.ranked.filter(e => Math.abs(e.offset - 0.5) < 1e-9);
+  assert.equal(halves.length, 1, `drift, alternate and zigzag coincide at 50%: ${JSON.stringify(halves.map(h => h.label))}`);
+  assert.equal(halves[0].label, 'running bond, 50%', 'and it is not labelled with a course shape it does not have');
+  // a third-module offset really is three different layouts
+  const thirds = o.ranked.filter(e => Math.abs(e.offset - 1 / 3) < 1e-9);
+  assert.equal(thirds.length, 3, JSON.stringify(thirds.map(t => t.label)));
+  assert.deepEqual(o.ranked.filter(e => e.isCurrent).length, 1, 'exactly one entry is the current one');
+  return `${o.ranked.length} distinct variants from 4 offsets x 3 shapes; 50% collapses to one, 33% stays three`;
+});
+
+test('optimizeLayout can compare patterns when asked, and refuses a bad trade', '120x144, 12x24: stack against running, diagonal and herringbone', () => {
+  const input = { room: { width: 120, height: 144 }, tile: { width: 12, height: 24, rectified: true }, grout: 3 / 16, pattern: 'stack' };
+  const o = optimizeLayout(input, { patterns: ['stack', 'running', 'diagonal', 'herringbone'] });
+  const by = (label) => o.ranked.find(e => e.label === label);
+  const herring = by('herringbone'), stack = by('stack bond');
+  assert.ok(herring && stack);
+  // herringbone cuts fewer pieces here, but at nine fence settings against two
+  assert.ok(herring.ease.cutTiles < stack.ease.cutTiles, 'herringbone really does cut fewer');
+  assert.ok(herring.ease.cutSizes > stack.ease.cutSizes + 2);
+  assert.notEqual(o.best.label, 'herringbone', 'and must not be called the easiest for it');
+  assert.ok(o.ranked.indexOf(by('45° diagonal')) > o.ranked.indexOf(stack), 'diagonal is the hardest of the four');
+  return `best ${o.best.label}; herringbone ${herring.ease.cutTiles} cuts in ${herring.ease.cutSizes} sizes loses to stack ${stack.ease.cutTiles} in ${stack.ease.cutSizes}`;
 });
 
 // ---------------------------------------------------------------------------
