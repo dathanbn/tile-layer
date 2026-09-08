@@ -359,21 +359,54 @@ function screenSpace(s, c) {
   <div style="display:flex; gap:8px; flex-wrap:wrap;">
     ${[['Island', 72, 36], ['Column', 12, 12], ['Hearth', 54, 20]].map(([label, w, d]) => `<button class="obstacle-chip" data-act="${act(() => addObstacle(label, w, d))}">+ ${label}</button>`).join('')}
   </div>
-  ${s.obstacles.map(o => `<div class="obstacle-row${s.selectedObstacle === o.id ? ' selected' : ''}" data-act="${act(() => setState({ selectedObstacle: o.id }))}">
+  ${s.obstacles.map(o => {
+    const selected = s.selectedObstacle === o.id;
+    return `<div class="obstacle-row${selected ? ' selected' : ''}" data-obstacle-id="${o.id}" data-act="${act(() => setState({ selectedObstacle: o.id }))}">
     <div class="obstacle-swatch"></div>
-    <div style="flex:1;"><div class="name">${esc(o.label)}</div><div class="size">${o.w}" × ${o.d}" — tile stops at its edge</div></div>
+    <div style="flex:1;">
+      <div class="name">${esc(o.label)}</div>
+      <div class="size">${o.w}" × ${o.d}" — tile stops at its edge</div>
+      ${selected ? `<div style="display:flex; gap:8px; margin-top:10px;">
+        <div style="flex:1;">
+          <div class="mono-note" style="margin-bottom:4px;">width</div>
+          <div class="stepper mini">
+            <button class="dec" data-act="${act(() => resizeObstacle(o.id, 'w', -6))}">−</button>
+            <div class="mid"><div class="val">${o.w}"</div></div>
+            <button class="inc" data-act="${act(() => resizeObstacle(o.id, 'w', 6))}">+</button>
+          </div>
+        </div>
+        <div style="flex:1;">
+          <div class="mono-note" style="margin-bottom:4px;">depth</div>
+          <div class="stepper mini">
+            <button class="dec" data-act="${act(() => resizeObstacle(o.id, 'd', -6))}">−</button>
+            <div class="mid"><div class="val">${o.d}"</div></div>
+            <button class="inc" data-act="${act(() => resizeObstacle(o.id, 'd', 6))}">+</button>
+          </div>
+        </div>
+      </div>` : ''}
+    </div>
     <button data-act="${act(() => setState(st => {
       const obstacles = st.obstacles.filter(x => x.id !== o.id);
       return { obstacles, selectedObstacle: st.selectedObstacle === o.id ? (obstacles[0] && obstacles[0].id) : st.selectedObstacle };
     }))}">×</button>
-  </div>`).join('')}
+  </div>`;
+  }).join('')}
   ${s.obstacles.length ? `<div style="margin-top:12px;">
-    <div class="mono-note" style="margin-bottom:6px;">tap the plan to place the selected obstacle — ${esc((s.obstacles.find(o => o.id === s.selectedObstacle) || s.obstacles[0]).label)}</div>
+    <div class="mono-note" style="margin-bottom:6px;" id="obstacle-hint">drag the shape, or tap the plan to move it there — ${esc((s.obstacles.find(o => o.id === s.selectedObstacle) || s.obstacles[0]).label)}</div>
     <div class="drawing-frame" style="margin-top:0;">
-      <div class="drawing-body" id="room-preview" style="cursor:crosshair;"></div>
+      <div class="drawing-body" id="room-preview"></div>
     </div>
   </div>` : ''}`;
   return html;
+}
+
+function updateObstacleSelectionUI(id) {
+  document.querySelectorAll('[data-obstacle-id]').forEach(el => {
+    el.classList.toggle('selected', el.dataset.obstacleId === String(id));
+  });
+  const hint = document.getElementById('obstacle-hint');
+  const o = state.obstacles.find(x => x.id === id);
+  if (hint && o) hint.textContent = `drag the shape, or tap the plan to move it there — ${o.label}`;
 }
 
 function pickObstaclePoint(x, y) {
@@ -387,6 +420,35 @@ function pickObstaclePoint(x, y) {
       y: Math.max(0, Math.min(height - o.d, y - o.d / 2)),
     });
     return { obstacles, selectedObstacle: id };
+  });
+}
+
+function moveObstacle(id, x, y) {
+  setState(st => {
+    const width = W(st), height = L(st);
+    const obstacles = st.obstacles.map(o => o.id !== id ? o : {
+      ...o,
+      x: Math.max(0, Math.min(width - o.w, x)),
+      y: Math.max(0, Math.min(height - o.d, y)),
+    });
+    return { obstacles, selectedObstacle: id };
+  });
+}
+
+function resizeObstacle(id, dim, delta) {
+  setState(st => {
+    const width = W(st), height = L(st);
+    const obstacles = st.obstacles.map(o => {
+      if (o.id !== id) return o;
+      const nextW = dim === 'w' ? Math.max(6, Math.min(width, o.w + delta)) : o.w;
+      const nextD = dim === 'd' ? Math.max(6, Math.min(height, o.d + delta)) : o.d;
+      return {
+        ...o, w: nextW, d: nextD,
+        x: Math.max(0, Math.min(width - nextW, o.x)),
+        y: Math.max(0, Math.min(height - nextD, o.y)),
+      };
+    });
+    return { obstacles };
   });
 }
 
@@ -697,7 +759,11 @@ function render() {
   }
   if (s.screen === 'space' && s.obstacles.length) {
     const selected = s.selectedObstacle ?? s.obstacles[0].id;
-    renderRoomPreview(document.getElementById('room-preview'), roomPolygon(s), s.obstacles, selected, pickObstaclePoint);
+    renderRoomPreview(document.getElementById('room-preview'), roomPolygon(s), s.obstacles, selected, {
+      onSelect: updateObstacleSelectionUI,
+      onDragEnd: moveObstacle,
+      onPick: pickObstaclePoint,
+    });
   }
 }
 

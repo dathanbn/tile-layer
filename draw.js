@@ -124,33 +124,78 @@ export function renderPlan(container, result) {
 }
 
 /**
- * renderRoomPreview(container, polygon, obstacles, selectedId, onPick)
+ * renderRoomPreview(container, polygon, obstacles, selectedId, handlers)
  *   polygon     the room outline (array of {x,y}, inches) — no tiles yet,
  *               this runs on the Space screen before a tile is even picked
  *   obstacles   [{ id, label, x, y, w, d }] in room inches
- *   selectedId  which obstacle a tap should move
- *   onPick(x, y)  called with the tapped point in room inches
+ *   selectedId  which obstacle is highlighted
+ *   handlers.onSelect(id)      an obstacle was grabbed — update the
+ *                              surrounding page's highlight/hint immediately,
+ *                              without waiting for the drag to finish
+ *   handlers.onDragEnd(id,x,y) drag released; x,y is the obstacle's new
+ *                              top-left corner, in room inches
+ *   handlers.onPick(x, y)      the empty floor was tapped — move whichever
+ *                              obstacle is currently selected there, centered
+ *                              on the tap
  */
-export function renderRoomPreview(container, polygon, obstacles, selectedId, onPick) {
+export function renderRoomPreview(container, polygon, obstacles, selectedId, handlers) {
   if (!container) return;
+  const { onSelect, onDragEnd, onPick } = handlers;
   const width = Math.max(...polygon.map(p => p.x));
   const height = Math.max(...polygon.map(p => p.y));
   const pad = Math.max(6, Math.min(width, height) * 0.08);
   const vbX = -pad, vbY = -pad, vbW = width + pad * 2, vbH = height + pad * 2;
   const svg = svgEl('svg', {
     viewBox: `${vbX} ${vbY} ${vbW} ${vbH}`, preserveAspectRatio: 'xMidYMid meet',
-    width: '100%', height: '100%', style: 'display:block;',
+    width: '100%', height: '100%', style: 'display:block; touch-action:none;',
   });
+
+  function toRoomPoint(e) {
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX; pt.y = e.clientY;
+    return pt.matrixTransform(svg.getScreenCTM().inverse());
+  }
 
   svg.appendChild(svgEl('polygon', { points: polygonPoints(polygon), fill: '#F4F5F2' }));
 
+  const DRAG_THRESHOLD = 4; // inches of pointer movement before a tap counts as a drag
+
   for (const o of obstacles) {
     const selected = o.id === selectedId;
-    svg.appendChild(svgEl('rect', {
+    const rect = svgEl('rect', {
       x: o.x, y: o.y, width: o.w, height: o.d,
       fill: selected ? '#C8462A' : '#D98A73',
-      stroke: selected ? '#15181B' : 'none', 'stroke-width': 1.5, style: NON_SCALING,
-    }));
+      stroke: selected ? '#15181B' : 'none', 'stroke-width': 1.5, style: NON_SCALING + 'cursor:grab;',
+    });
+
+    rect.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      rect.setPointerCapture(e.pointerId);
+      const start = toRoomPoint(e);
+      const grabDx = start.x - o.x, grabDy = start.y - o.y;
+      let dragged = false;
+      onSelect(o.id);
+
+      const move = (ev) => {
+        const p = toRoomPoint(ev);
+        if (!dragged && Math.hypot(p.x - start.x, p.y - start.y) > DRAG_THRESHOLD) dragged = true;
+        if (!dragged) return;
+        const nx = Math.max(0, Math.min(width - o.w, p.x - grabDx));
+        const ny = Math.max(0, Math.min(height - o.d, p.y - grabDy));
+        rect.setAttribute('x', nx);
+        rect.setAttribute('y', ny);
+      };
+      const up = (ev) => {
+        rect.removeEventListener('pointermove', move);
+        rect.removeEventListener('pointerup', up);
+        if (dragged) {
+          onDragEnd(o.id, Number(rect.getAttribute('x')), Number(rect.getAttribute('y')));
+        }
+      };
+      rect.addEventListener('pointermove', move);
+      rect.addEventListener('pointerup', up);
+    });
+    svg.appendChild(rect);
   }
 
   svg.appendChild(svgEl('polygon', {
@@ -158,9 +203,7 @@ export function renderRoomPreview(container, polygon, obstacles, selectedId, onP
   }));
 
   svg.addEventListener('click', (e) => {
-    const pt = svg.createSVGPoint();
-    pt.x = e.clientX; pt.y = e.clientY;
-    const loc = pt.matrixTransform(svg.getScreenCTM().inverse());
+    const loc = toRoomPoint(e);
     onPick(loc.x, loc.y);
   });
 

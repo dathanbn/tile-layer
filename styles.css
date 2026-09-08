@@ -131,6 +131,9 @@ h1.title { font-size: 26px; font-weight: 800; letter-spacing: -0.02em; margin: 0
 .stepper .mid .unit { font-family: var(--mono); font-size: 10px; color: var(--muted-3); }
 .stepper.small { height: 56px; }
 .stepper.small button { width: 48px; }
+.stepper.mini { height: 40px; }
+.stepper.mini button { width: 36px; font-size: 18px; }
+.stepper.mini .val { font-size: 14px; }
 
 .chip-row { display: flex; gap: 6px; }
 .chip {
